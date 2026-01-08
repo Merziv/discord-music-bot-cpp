@@ -1,0 +1,67 @@
+# Build directories
+build/
+dist/
+CMakeFiles/
+Testing/
+.cmake/
+
+# Config files (contains secrets)
+config.json
+
+# CMake generated files
+CMakeCache.txt
+cmake_install.cmake
+CTestTestfile.cmake
+DartConfiguration.tcl
+Makefile
+compile_commands.json
+CMakePresets.json
+CMakeUserPresets.json
+
+# Conan generated files
+conan_toolchain.cmake
+cmakedeps_macros.cmake
+conandeps_legacy.cmake
+conanbuild.sh
+conanrun.sh
+conanbuildenv-*.sh
+conanrunenv-*.sh
+deactivate_conanbuild.sh
+deactivate_conanrun.sh
+*-config.cmake
+*-config-version.cmake
+*-Target-release.cmake
+*-release-x86_64-data.cmake
+*Targets.cmake
+*Config.cmake
+*ConfigVersion.cmake
+Find*.cmake
+
+# Clangd
+.cache/
+.clangd
+
+# Build artifacts
+*.o
+*.a
+*.so
+*.dylib
+music_bot
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.github/
+
+# Temporary files
+*.log
+*.tmp
+*.pcm
+*.raw
+
+# OS files
+.DS_Store
+Thumbs.db

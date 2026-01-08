@@ -1,0 +1,8 @@
+[requires]
+dpp/10.0.35
+opus/1.4
+rapidjson/cci.20230929
+
+[generators]
+CMakeDeps
+CMakeToolchain

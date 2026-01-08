@@ -1,0 +1,4 @@
+# Install with: pip install -r requirements.txt
+# Or with pipx: pipx install yt-dlp
+
+yt-dlp>=2024.0.0

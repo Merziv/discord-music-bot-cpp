@@ -1,0 +1,11 @@
+{
+  "bot": {
+    "token": "YOUR_BOT_TOKEN_HERE",
+    "startup_message": "Bot is now online!",
+    "status_playing_game": "Music",
+    "command_prefix": "!",
+    "channel_id": 123456789012345678,
+    "reaction_image": "🎵",
+    "idle_timeout_minutes": 5
+  }
+}
