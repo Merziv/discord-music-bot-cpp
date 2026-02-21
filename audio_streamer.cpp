@@ -91,7 +91,7 @@ void AudioStreamer::producerLoop(const std::stop_token& stopToken)
 
   AudioFrame frame{};
   size_t frameOffset = 0;
-  std::array<char, 65536> readBuf{};
+  std::array<char, 131072> readBuf{};
 
   while (!stopToken.stop_requested() && !_shouldStop.load(std::memory_order_acquire)
          && !_controller.shouldStop())
@@ -136,9 +136,9 @@ void AudioStreamer::producerLoop(const std::stop_token& stopToken)
           {
             break;
           }
-          if (++spinCount > 1000)
+          if (++spinCount > 10)
           {
-            std::this_thread::sleep_for(std::chrono::microseconds(100));
+            std::this_thread::sleep_for(std::chrono::milliseconds(1));
             spinCount = 0;
           }
           else
