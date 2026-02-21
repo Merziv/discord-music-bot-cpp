@@ -16,6 +16,7 @@
 #include <dpp/message.h>
 #include <dpp/misc-enum.h>
 #include <dpp/presence.h>
+#include <expected>
 #include <format>
 #include <iostream>
 #include <memory>
@@ -66,6 +67,7 @@ std::atomic<bool> isCurrentlyPlaying{false};
 std::chrono::steady_clock::time_point currentTrackStart{};
 std::mutex playTimeMutex;
 std::string currentTrackTitle;
+std::jthread voiceSessionThread;
 
 [[nodiscard]] inline const config::BotConfig& botConfig()
 {
@@ -173,7 +175,7 @@ void streamAudio(dpp::discord_voice_client* voiceClient, const QueueItem& item)
   }
 }
 
-void voiceSessionLoop(dpp::discord_voice_client* voiceClient, dpp::snowflake guildId)
+void voiceSessionLoop(dpp::discord_voice_client* voiceClient, const dpp::snowflake guildId)
 {
   logging::info("Voice session started for guild {}", static_cast<uint64_t>(guildId));
 
@@ -216,18 +218,58 @@ void voiceSessionLoop(dpp::discord_voice_client* voiceClient, dpp::snowflake gui
   logging::info("Voice session ended");
 }
 
+[[nodiscard]] std::expected<std::string, std::string> sanitizeQuery(std::string_view input)
+{
+  auto start = input.find_first_not_of(" \t\n\r");
+  if (start == std::string_view::npos)
+  {
+    return std::unexpected(
+      std::format("Usage: `{}play <YouTube URL or search query>`", botConfig().commandPrefix));
+  }
+  auto end = input.find_last_not_of(" \t\n\r");
+  input = input.substr(start, end - start + 1);
+
+  constexpr size_t MAX_QUERY_LENGTH = 500;
+  if (input.size() > MAX_QUERY_LENGTH)
+  {
+    return std::unexpected(std::string("\u274c Query is too long (max 500 characters)"));
+  }
+
+  for (char c : input)
+  {
+    if (c == '\0' || (static_cast<unsigned char>(c) < 0x20 && c != ' ' && c != '\t'))
+    {
+      return std::unexpected(std::string("\u274c Query contains invalid characters"));
+    }
+  }
+
+  if (input.starts_with('-'))
+  {
+    return std::unexpected(std::string("\u274c Invalid query"));
+  }
+
+  if (input.starts_with('/') || input.starts_with("file://"))
+  {
+    return std::unexpected(std::string("\u274c Local file paths are not supported"));
+  }
+
+  return std::string(input);
+}
+
 void handlePlayCommand(
-  const dpp::message_create_t& event, std::string_view query, bool addToFront = false)
+  const dpp::message_create_t& event, std::string_view rawQuery, bool addToFront = false)
 {
   const auto& msg = event.msg;
 
-  if (query.empty())
+  auto sanitized = sanitizeQuery(rawQuery);
+  if (!sanitized)
   {
     bot->message_create(dpp::message()
                           .set_channel_id(botChannelId())
-                          .set_content("Usage: `!play <YouTube URL or search query>`"));
+                          .set_content(sanitized.error()));
     return;
   }
+  const auto& query = *sanitized;
 
   logging::info("Received play request: {}", query);
 
@@ -851,8 +893,11 @@ int main(int argc, char* argv[])
       voiceConnected.store(true, std::memory_order_release);
       auto guildId = currentGuildId.load(std::memory_order_acquire);
 
-      std::jthread sessionThread(voiceSessionLoop, vc, guildId);
-      sessionThread.detach();
+      if (voiceSessionThread.joinable())
+      {
+        voiceSessionThread.join();
+      }
+      voiceSessionThread = std::jthread(voiceSessionLoop, vc, guildId);
     }
   });
 
@@ -864,6 +909,15 @@ int main(int argc, char* argv[])
   }
 
   logging::info("Shutting down...");
+
+  musicQueue.shutdown();
+  musicQueue.requestSkip();
+
+  if (voiceSessionThread.joinable())
+  {
+    voiceSessionThread.join();
+  }
+
   bot->shutdown();
 
   return 0;

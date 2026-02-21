@@ -31,6 +31,7 @@ class MusicQueueManager
   std::atomic<bool> _isPlaying{false};
   std::atomic<bool> _shouldStopCurrent{false};
   std::atomic<bool> _isPaused{false};
+  std::atomic<bool> _shutdown{false};
   std::chrono::steady_clock::time_point _lastActivity;
 
 public:
@@ -63,8 +64,14 @@ public:
   [[nodiscard]] std::optional<QueueItem> waitForItem(std::chrono::milliseconds timeout)
   {
     std::unique_lock lock(_mutex);
-    if (_cv.wait_for(lock, timeout, [this] { return !_queue.empty(); }))
+    if (_cv.wait_for(lock, timeout, [this] {
+          return !_queue.empty() || _shutdown.load(std::memory_order_acquire);
+        }))
     {
+      if (_queue.empty())
+      {
+        return std::nullopt;
+      }
       auto item = std::move(_queue.front());
       _queue.pop_front();
       _lastActivity = std::chrono::steady_clock::now();
@@ -266,6 +273,13 @@ public:
     _lastActivity = std::chrono::steady_clock::now();
   }
 
+  void shutdown()
+  {
+    _shutdown.store(true, std::memory_order_release);
+    _cv.notify_all();
+    _pauseCv.notify_all();
+  }
+
   void requestSkip()
   {
     _shouldStopCurrent.store(true, std::memory_order_release);
@@ -302,8 +316,10 @@ public:
     std::shared_lock lock(_mutex);
     _pauseCv.wait(lock, [this] {
       return !_isPaused.load(std::memory_order_acquire)
-             || _shouldStopCurrent.load(std::memory_order_acquire);
+             || _shouldStopCurrent.load(std::memory_order_acquire)
+             || _shutdown.load(std::memory_order_acquire);
     });
-    return !_shouldStopCurrent.load(std::memory_order_acquire);
+    return !_shouldStopCurrent.load(std::memory_order_acquire)
+           && !_shutdown.load(std::memory_order_acquire);
   }
 };

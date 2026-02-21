@@ -49,6 +49,30 @@ namespace {
   return output;
 }
 
+[[nodiscard]] std::string shellQuote(std::string_view str)
+{
+  std::string out;
+  out.reserve(str.size() + 10);
+  out.push_back('\'');
+  for (char c : str)
+  {
+    if (c == '\'')
+    {
+      out += "'\\''";
+    }
+    else if (c == '\0')
+    {
+      continue;
+    }
+    else
+    {
+      out.push_back(c);
+    }
+  }
+  out.push_back('\'');
+  return out;
+}
+
 namespace json {
 
 [[nodiscard]] std::optional<std::string> getString(const rapidjson::Value& obj, const char* key)
@@ -95,7 +119,7 @@ namespace json {
     doc.Parse(blob.data() + pos, blob.size() - pos);
     if (!doc.HasParseError() && doc.IsObject())
     {
-      return std::move(doc);
+      return doc;
     }
   }
   return std::nullopt;
@@ -212,7 +236,7 @@ std::expected<ExtractedInfo, std::string> extractStreamInfo(std::string_view que
       "--ignore-config --no-check-certificate "
       "--default-search auto --quiet --no-warnings "
       "--retries 5 --source-address 0.0.0.0 ";
-    cmd += std::format("\"{}\"", query);
+    cmd += shellQuote(query);
     return cmd;
   };
 
@@ -360,8 +384,8 @@ std::optional<PlaylistInfo> extractPlaylistInfo(std::string_view query)
     "yt-dlp --flat-playlist --dump-single-json "
     "--ignore-config --no-check-certificate "
     "--quiet --no-warnings "
-    "--retries 3 --source-address 0.0.0.0 \"{}\"",
-    query);
+    "--retries 3 --source-address 0.0.0.0 {}",
+    shellQuote(query));
 
   logging::debug("Running yt-dlp playlist extraction: {}", cmd);
 

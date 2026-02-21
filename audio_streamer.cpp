@@ -250,20 +250,24 @@ std::string AudioStreamer::makeTempLogPath(const char* prefix)
 std::string AudioStreamer::quote(std::string_view str)
 {
   std::string out;
-  out.reserve(str.size() + 2);
-  out.push_back('"');
+  out.reserve(str.size() + 10);
+  out.push_back('\'');
   for (char c : str)
   {
-    if (c == '"')
+    if (c == '\'')
     {
-      out += "\\\"";
+      out += "'\\''";
+    }
+    else if (c == '\0')
+    {
+      continue;
     }
     else
     {
       out.push_back(c);
     }
   }
-  out.push_back('"');
+  out.push_back('\'');
   return out;
 }
 
