@@ -1,19 +1,21 @@
 #include "audio_streamer.h"
 
+#include <cerrno>
+#include <csignal>
 #include <cstring>
 #include <fcntl.h>
+#include <poll.h>
+#include <sys/wait.h>
 #include <unistd.h>
 #include <vector>
 
 namespace audio {
 
 AudioStreamer::AudioStreamer(
-  dpp::discord_voice_client* voiceClient,
   std::string streamUrl,
   std::string title,
   PlaybackController controller)
-  : _voiceClient(voiceClient)
-  , _streamUrl(std::move(streamUrl))
+  : _streamUrl(std::move(streamUrl))
   , _title(std::move(title))
   , _controller(std::move(controller))
 {
@@ -34,6 +36,13 @@ void AudioStreamer::start()
 void AudioStreamer::stop()
 {
   _shouldStop.store(true, std::memory_order_release);
+
+  int pid = _ffmpegPid.load(std::memory_order_acquire);
+  if (pid > 0)
+  {
+    ::kill(pid, SIGTERM);
+  }
+
   if (_producerThread.joinable())
   {
     _producerThread.request_stop();
@@ -63,39 +72,126 @@ void AudioStreamer::initEncoder()
 void AudioStreamer::producerLoop(const std::stop_token& stopToken)
 {
   const std::string ffmpegErrLog = makeTempLogPath("ffmpeg_audio");
-  const std::string ffmpegCmd = std::format(
-    "ffmpeg -hide_banner -loglevel warning -nostdin "
-    "-reconnect 1 -reconnect_streamed 1 -reconnect_delay_max 5 "
-    "-fflags +nobuffer+discardcorrupt -flags low_delay "
-    "-probesize 32M -analyzeduration 0 "
-    "-i {} "
-    "-ar {} -ac {} "
-    "-f s16le -vn pipe:1 2>{}",
-    quote(_streamUrl),
-    SAMPLE_RATE,
-    CHANNELS,
-    quote(ffmpegErrLog));
+  const std::string sampleRateStr = std::to_string(SAMPLE_RATE);
+  const std::string channelsStr = std::to_string(CHANNELS);
 
-  logging::debug("Launching ffmpeg: {}", ffmpegCmd);
-
-  FILE* pipe = popen(ffmpegCmd.c_str(), "r");
-  if (pipe == nullptr)
+  int pipefd[2];
+  if (pipe(pipefd) != 0)
   {
-    logging::error("Failed to start ffmpeg");
+    logging::error("Failed to create pipe for ffmpeg");
     _producerDone.store(true, std::memory_order_release);
     return;
   }
 
-  int fd = fileno(pipe);
+  pid_t pid = fork();
+  if (pid < 0)
+  {
+    ::close(pipefd[0]);
+    ::close(pipefd[1]);
+    logging::error("Failed to fork for ffmpeg");
+    _producerDone.store(true, std::memory_order_release);
+    return;
+  }
+
+  if (pid == 0)
+  {
+    ::close(pipefd[0]);
+
+    if (dup2(pipefd[1], STDOUT_FILENO) < 0)
+    {
+      _exit(127);
+    }
+    ::close(pipefd[1]);
+
+    int errfd = ::open(ffmpegErrLog.c_str(), O_WRONLY | O_CREAT | O_TRUNC, 0644);
+    if (errfd >= 0)
+    {
+      dup2(errfd, STDERR_FILENO);
+      ::close(errfd);
+    }
+
+    int devnull = ::open("/dev/null", O_RDONLY);
+    if (devnull >= 0)
+    {
+      dup2(devnull, STDIN_FILENO);
+      ::close(devnull);
+    }
+
+    // NOLINTBEGIN(cppcoreguidelines-pro-type-vararg)
+    execlp(
+      "ffmpeg",
+      "ffmpeg",
+      "-hide_banner",
+      "-loglevel",
+      "warning",
+      "-nostdin",
+      "-reconnect",
+      "1",
+      "-reconnect_streamed",
+      "1",
+      "-reconnect_delay_max",
+      "5",
+      "-fflags",
+      "+nobuffer+discardcorrupt",
+      "-flags",
+      "low_delay",
+      "-probesize",
+      "1M",
+      "-analyzeduration",
+      "0",
+      "-i",
+      _streamUrl.c_str(),
+      "-ar",
+      sampleRateStr.c_str(),
+      "-ac",
+      channelsStr.c_str(),
+      "-f",
+      "s16le",
+      "-vn",
+      "pipe:1",
+      static_cast<char*>(nullptr));
+    // NOLINTEND(cppcoreguidelines-pro-type-vararg)
+
+    _exit(127);
+  }
+
+  ::close(pipefd[1]);
+  int fd = pipefd[0];
+
   fcntl(fd, F_SETPIPE_SZ, 1024 * 1024);
+  _ffmpegPid.store(static_cast<int>(pid), std::memory_order_release);
+
+  logging::debug(
+    "Launched ffmpeg pid={} for '{}', stderr log: {}",
+    static_cast<int>(pid),
+    _title,
+    ffmpegErrLog);
 
   AudioFrame frame{};
   size_t frameOffset = 0;
   std::array<char, 131072> readBuf{};
+  constexpr int POLL_TIMEOUT_MS = 200;
 
   while (!stopToken.stop_requested() && !_shouldStop.load(std::memory_order_acquire)
          && !_controller.shouldStop())
   {
+    struct pollfd pfd = {.fd = fd, .events = POLLIN, .revents = 0};
+    int ret = poll(&pfd, 1, POLL_TIMEOUT_MS);
+
+    if (ret == 0)
+    {
+      continue;
+    }
+    if (ret < 0)
+    {
+      if (errno == EINTR)
+      {
+        continue;
+      }
+      logging::warn("Poll error on ffmpeg pipe: {}", strerror(errno));
+      break;
+    }
+
     ssize_t bytesRead = ::read(fd, readBuf.data(), readBuf.size());
 
     if (bytesRead <= 0)
@@ -151,30 +247,90 @@ void AudioStreamer::producerLoop(const std::stop_token& stopToken)
     }
   }
 
-  pclose(pipe);
+  ::close(fd);
+  _ffmpegPid.store(-1, std::memory_order_release);
+
+  ::kill(pid, SIGTERM);
+
+  int status = 0;
+  for (int i = 0; i < 20; ++i)
+  {
+    if (waitpid(pid, &status, WNOHANG) != 0)
+    {
+      pid = -1;
+      break;
+    }
+    std::this_thread::sleep_for(std::chrono::milliseconds(50));
+  }
+  if (pid > 0)
+  {
+    ::kill(pid, SIGKILL);
+    waitpid(pid, &status, 0);
+  }
+
   _producerDone.store(true, std::memory_order_release);
   logging::info("Audio producer finished");
 }
 
 void AudioStreamer::consumerLoop()
 {
-  _voiceClient->set_timescale(1'000'000);
-  _voiceClient->set_send_audio_type(dpp::discord_voice_client::satype_overlap_audio);
-
-  std::vector<unsigned char> opusBuf(10000);
-
   using Clock = std::chrono::steady_clock;
-  auto nextFrameTime = Clock::now();
   constexpr auto frameDuration = std::chrono::milliseconds(FRAME_DURATION_MS);
 
   constexpr size_t PREBUFFER_FRAMES = 50;
+  constexpr auto PREBUFFER_TIMEOUT = std::chrono::seconds(15);
+  auto prebufferStart = Clock::now();
+
   while (_ringBuffer.size() < PREBUFFER_FRAMES && !_producerDone.load(std::memory_order_acquire)
-         && !_shouldStop.load(std::memory_order_acquire) && !_controller.shouldStop())
+         && !_shouldStop.load(std::memory_order_acquire) && !_controller.shouldStop()
+         && (Clock::now() - prebufferStart) < PREBUFFER_TIMEOUT)
   {
     std::this_thread::sleep_for(std::chrono::milliseconds(10));
   }
 
+  if (_ringBuffer.empty())
+  {
+    logging::warn("No audio data available after pre-buffer phase");
+    logging::info("Audio consumer finished");
+    return;
+  }
+
   logging::info("Pre-buffer complete, starting playback. Buffer size: {}", _ringBuffer.size());
+  {
+    constexpr int MAX_READY_POLLS = 50;
+    for (int i = 0; i < MAX_READY_POLLS; ++i)
+    {
+      if (_controller.isReady())
+      {
+        logging::info("Voice client confirmed ready (poll {})", i);
+        break;
+      }
+      if (_shouldStop.load(std::memory_order_acquire) || _controller.shouldStop())
+      {
+        logging::warn("Stopped while waiting for voice readiness");
+        logging::info("Audio consumer finished");
+        return;
+      }
+      std::this_thread::sleep_for(std::chrono::milliseconds(100));
+    }
+
+    if (!_controller.isReady())
+    {
+      logging::error("Voice client not ready after 5s, aborting playback");
+      logging::info("Audio consumer finished");
+      return;
+    }
+  }
+
+  // Set overlap audio mode so DPP sends each opus packet immediately via UDP,
+  // bypassing DPP's internal send thread which can get stuck after reconnections.
+  _controller.configureVoiceClient();
+
+  std::vector<unsigned char> opusBuf(4000);
+  auto nextFrameTime = Clock::now();
+  bool stoppedEarly = false;
+  size_t sendCount = 0;
+  _playedAudio.store(false, std::memory_order_release);
 
   while (!_shouldStop.load(std::memory_order_acquire) && !_controller.shouldStop())
   {
@@ -182,6 +338,7 @@ void AudioStreamer::consumerLoop()
     {
       if (!_controller.waitWhilePaused())
       {
+        stoppedEarly = true;
         break;
       }
       nextFrameTime = Clock::now();
@@ -196,7 +353,7 @@ void AudioStreamer::consumerLoop()
         logging::info("Buffer drained, playback complete");
         break;
       }
-      std::this_thread::sleep_for(std::chrono::milliseconds(5));
+      std::this_thread::sleep_for(std::chrono::milliseconds(2));
       continue;
     }
 
@@ -215,7 +372,23 @@ void AudioStreamer::consumerLoop()
       continue;
     }
 
-    _voiceClient->send_audio_opus(opusBuf.data(), static_cast<size_t>(bytes));
+    if (!_controller.trySendAudioOpus(opusBuf.data(), static_cast<size_t>(bytes)))
+    {
+      logging::warn("Voice client disconnected, stopping playback");
+      stoppedEarly = true;
+      break;
+    }
+
+    _playedAudio.store(true, std::memory_order_release);
+    ++sendCount;
+
+    if (sendCount % 500 == 1)
+    {
+      logging::debug(
+        "Audio watchdog: sends={}, ring={}",
+        sendCount,
+        _ringBuffer.size());
+    }
 
     nextFrameTime += frameDuration;
     auto now = Clock::now();
@@ -226,9 +399,16 @@ void AudioStreamer::consumerLoop()
     }
     else if (now - nextFrameTime > std::chrono::milliseconds(100))
     {
+      logging::warn("Audio timing reset due to lag (drift={}ms)",
+        std::chrono::duration_cast<std::chrono::milliseconds>(now - nextFrameTime).count());
       nextFrameTime = now;
-      logging::warn("Audio timing reset due to lag");
     }
+  }
+
+  if (stoppedEarly || _shouldStop.load(std::memory_order_acquire) || _controller.shouldStop())
+  {
+    _controller.tryStopAudio();
+    logging::info("Audio stopped early, cleared DPP buffer");
   }
 
   logging::info("Audio consumer finished");
@@ -245,30 +425,6 @@ std::string AudioStreamer::makeTempLogPath(const char* prefix)
     close(fd);
   }
   return {tmpl.data()};
-}
-
-std::string AudioStreamer::quote(std::string_view str)
-{
-  std::string out;
-  out.reserve(str.size() + 10);
-  out.push_back('\'');
-  for (char c : str)
-  {
-    if (c == '\'')
-    {
-      out += "'\\''";
-    }
-    else if (c == '\0')
-    {
-      continue;
-    }
-    else
-    {
-      out.push_back(c);
-    }
-  }
-  out.push_back('\'');
-  return out;
 }
 
 }  // namespace audio

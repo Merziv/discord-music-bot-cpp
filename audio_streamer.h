@@ -4,7 +4,6 @@
 #include <atomic>
 #include <chrono>
 #include <cstdint>
-#include <dpp/discordvoiceclient.h>
 #include <format>
 #include <functional>
 #include <iostream>
@@ -173,6 +172,10 @@ struct PlaybackController
   std::function<bool()> shouldStop;
   std::function<bool()> isPaused;
   std::function<bool()> waitWhilePaused;
+  std::function<bool(const uint8_t*, size_t)> trySendAudioOpus;  // opus data length in bytes
+  std::function<void()> tryStopAudio;
+  std::function<bool()> isReady;
+  std::function<void()> configureVoiceClient;
 };
 
 class AudioStreamer
@@ -180,7 +183,6 @@ class AudioStreamer
   using AudioFrame = std::array<int16_t, TOTAL_SAMPLES>;
   using RingBuffer = LockFreeRingBuffer<AudioFrame, RING_BUFFER_FRAMES>;
 
-  dpp::discord_voice_client* _voiceClient;
   std::string _streamUrl;
   std::string _title;
   PlaybackController _controller;
@@ -188,6 +190,8 @@ class AudioStreamer
   RingBuffer _ringBuffer;
   std::atomic<bool> _producerDone{false};
   std::atomic<bool> _shouldStop{false};
+  std::atomic<bool> _playedAudio{false};
+  std::atomic<int> _ffmpegPid{-1};
 
   std::unique_ptr<OpusEncoder, decltype(&opus_encoder_destroy)> _encoder{
     nullptr, opus_encoder_destroy};
@@ -196,7 +200,6 @@ class AudioStreamer
 
 public:
   AudioStreamer(
-    dpp::discord_voice_client* voiceClient,
     std::string streamUrl,
     std::string title,
     PlaybackController controller);
@@ -211,13 +214,14 @@ public:
   void start();
   void stop();
 
+  [[nodiscard]] bool playedAudio() const noexcept { return _playedAudio.load(std::memory_order_acquire); }
+
 private:
   void initEncoder();
   void producerLoop(const std::stop_token& stopToken);
   void consumerLoop();
 
   [[nodiscard]] static std::string makeTempLogPath(const char* prefix);
-  [[nodiscard]] static std::string quote(std::string_view str);
 };
 
 }  // namespace audio

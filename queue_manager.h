@@ -32,11 +32,19 @@ class MusicQueueManager
   std::atomic<bool> _shouldStopCurrent{false};
   std::atomic<bool> _isPaused{false};
   std::atomic<bool> _shutdown{false};
+  std::atomic<bool> _disconnected{false};
   std::chrono::steady_clock::time_point _lastActivity;
 
 public:
   MusicQueueManager() : _lastActivity(std::chrono::steady_clock::now())
   {}
+
+  void resetForNewSession()
+  {
+    _disconnected.store(false, std::memory_order_release);
+    _shouldStopCurrent.store(false, std::memory_order_release);
+    _isPaused.store(false, std::memory_order_release);
+  }
 
   void enqueue(QueueItem item)
   {
@@ -65,7 +73,7 @@ public:
   {
     std::unique_lock lock(_mutex);
     if (_cv.wait_for(lock, timeout, [this] {
-          return !_queue.empty() || _shutdown.load(std::memory_order_acquire);
+          return !_queue.empty() || _shutdown.load(std::memory_order_acquire) || _disconnected.load(std::memory_order_acquire);
         }))
     {
       if (_queue.empty())
@@ -280,6 +288,13 @@ public:
     _pauseCv.notify_all();
   }
 
+  void setDisconnected(bool disconnected)
+  {
+    _disconnected.store(disconnected, std::memory_order_release);
+    _cv.notify_all();
+    _pauseCv.notify_all();
+  }
+
   void requestSkip()
   {
     _shouldStopCurrent.store(true, std::memory_order_release);
@@ -317,9 +332,11 @@ public:
     _pauseCv.wait(lock, [this] {
       return !_isPaused.load(std::memory_order_acquire)
              || _shouldStopCurrent.load(std::memory_order_acquire)
-             || _shutdown.load(std::memory_order_acquire);
+             || _shutdown.load(std::memory_order_acquire)
+             || _disconnected.load(std::memory_order_acquire);
     });
     return !_shouldStopCurrent.load(std::memory_order_acquire)
-           && !_shutdown.load(std::memory_order_acquire);
+           && !_shutdown.load(std::memory_order_acquire)
+           && !_disconnected.load(std::memory_order_acquire);
   }
 };

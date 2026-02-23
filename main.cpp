@@ -69,6 +69,9 @@ std::mutex playTimeMutex;
 std::string currentTrackTitle;
 std::jthread voiceSessionThread;
 
+std::mutex voiceClientMutex;
+dpp::discord_voice_client* activeVoiceClient{nullptr};
+
 [[nodiscard]] inline const config::BotConfig& botConfig()
 {
   return config::getConfig().bot();
@@ -87,7 +90,7 @@ void signalHandler(int /*signal*/)
   shutdownCV.notify_one();
 }
 
-void streamAudio(dpp::discord_voice_client* voiceClient, const QueueItem& item)
+void streamAudio(const QueueItem& item)
 {
   logging::info("Starting streamAudio. Query: {}", item.query);
   musicQueue.setPlaying(true);
@@ -99,60 +102,142 @@ void streamAudio(dpp::discord_voice_client* voiceClient, const QueueItem& item)
     isCurrentlyPlaying.store(true, std::memory_order_release);
   }
 
-  auto result = extractStreamInfo(item.query);
-  if (!result)
-  {
-    logging::error("Extractor error: {}", result.error());
-    bot->message_create(dpp::message()
-                          .set_channel_id(botChannelId())
-                          .set_content(std::format("❌ Error: {}", result.error())));
-    musicQueue.setPlaying(false);
-    isCurrentlyPlaying.store(false, std::memory_order_release);
-    return;
-  }
+  constexpr int MAX_RETRIES = 2;
+  bool played = false;
 
-  const auto& info = *result;
-  logging::info("Now playing: '{}'", info.title);
+  for (int attempt = 0; attempt <= MAX_RETRIES; ++attempt)
   {
-    std::lock_guard lock(playTimeMutex);
-    currentTrackTitle = info.title;
-  }
-  if (bot)
-  {
-    std::string pres = info.title;
-    if (pres.size() > 120)
+    if (attempt > 0)
     {
-      pres = pres.substr(0, 117) + "...";
+      logging::warn("Retrying stream extraction (attempt {}/{})", attempt + 1, MAX_RETRIES + 1);
     }
-    bot->set_presence(dpp::presence(dpp::ps_online, dpp::at_listening, pres));
+
+    if (musicQueue.shouldStop() || !voiceConnected.load(std::memory_order_acquire))
+    {
+      break;
+    }
+
+    auto result = extractStreamInfo(item.query);
+    if (!result)
+    {
+      logging::error("Extractor error: {}", result.error());
+      if (attempt == MAX_RETRIES)
+      {
+        bot->message_create(dpp::message()
+                              .set_channel_id(botChannelId())
+                              .set_content(std::format("❌ Error: {}", result.error())));
+      }
+      continue;
+    }
+
+    const auto& info = *result;
+
+    if (attempt == 0)
+    {
+      logging::info("Now playing: '{}'", info.title);
+      {
+        std::lock_guard lock(playTimeMutex);
+        currentTrackTitle = info.title;
+      }
+      if (bot)
+      {
+        std::string pres = info.title;
+        if (pres.size() > 120)
+        {
+          pres = pres.substr(0, 117) + "...";
+        }
+        bot->set_presence(dpp::presence(dpp::ps_online, dpp::at_listening, pres));
+      }
+
+      bot->message_create(dpp::message()
+                            .set_channel_id(botChannelId())
+                            .set_content(std::format(
+                              "🎵 Now playing: '{}'\n{} {}",
+                              info.title,
+                              info.webpageUrl,
+                              botConfig().botReactionImage)));
+    }
+    else
+    {
+      logging::info("Retry playing: '{}'", info.title);
+    }
+
+    logging::debug(
+      "Stream URL (truncated): {}...",
+      info.streamUrl.substr(0, std::min(info.streamUrl.size(), size_t{128})));
+
+    try
+    {
+      audio::PlaybackController controller{
+        .shouldStop = [] { return musicQueue.shouldStop() || !voiceConnected.load(std::memory_order_acquire); },
+        .isPaused = [] { return musicQueue.isPaused(); },
+        .waitWhilePaused = [] { return musicQueue.waitWhilePaused(); },
+        .trySendAudioOpus = [](const uint8_t* data, size_t len) -> bool {
+          std::lock_guard lock(voiceClientMutex);
+          if (!activeVoiceClient || !voiceConnected.load(std::memory_order_acquire))
+          {
+            return false;
+          }
+          // send_now=true: bypass DPP's internal outbuf/write_ready() path and call udp_send() (sendto) directly.  
+          // DPP's internal drain loop can get stuck after a voice reconnect, so we send the encrypted RTP packet ourselves.  
+          // Our own 20 ms timing in the consumer loop handles pacing.
+          activeVoiceClient->send_audio_opus(data, len, 20, true);
+          return true;
+        },
+        .tryStopAudio = [] {
+          std::lock_guard lock(voiceClientMutex);
+          if (activeVoiceClient && voiceConnected.load(std::memory_order_acquire))
+          {
+            activeVoiceClient->stop_audio();
+          }
+        },
+        .isReady = []() -> bool {
+          std::lock_guard lock(voiceClientMutex);
+          return activeVoiceClient != nullptr
+                 && voiceConnected.load(std::memory_order_acquire)
+                 && activeVoiceClient->is_ready();
+        },
+        .configureVoiceClient = [] {
+          std::lock_guard lock(voiceClientMutex);
+          if (activeVoiceClient && voiceConnected.load(std::memory_order_acquire))
+          {
+            // frame_size = 48 * duration * (timescale / 1 000 000)
+            activeVoiceClient->set_timescale(1000000);
+            // Send the speaking intent before any UDP audio packets
+            activeVoiceClient->speak();
+            logging::info("Voice client configured: timescale=1000000, direct UDP send");
+          }
+        },
+      };
+      audio::AudioStreamer streamer(info.streamUrl, info.title, std::move(controller));
+      streamer.start();
+
+      if (streamer.playedAudio())
+      {
+        played = true;
+        break;
+      }
+
+      logging::warn("No audio produced for '{}', will retry with fresh URL", info.title);
+    }
+    catch (const std::exception& e)
+    {
+      logging::error("Audio streaming error: {}", e.what());
+      if (attempt == MAX_RETRIES)
+      {
+        bot->message_create(dpp::message()
+                              .set_channel_id(botChannelId())
+                              .set_content(std::format("❌ Playback error: {}", e.what())));
+      }
+    }
   }
 
-  bot->message_create(
-    dpp::message()
-      .set_channel_id(botChannelId())
-      .set_content(std::format(
-        "🎵 Now playing: '{}'\n{} {}", info.title, info.webpageUrl, botConfig().botReactionImage)));
-
-  logging::debug(
-    "Stream URL (truncated): {}...",
-    info.streamUrl.substr(0, std::min(info.streamUrl.size(), size_t{128})));
-
-  try
+  if (!played && !musicQueue.shouldStop() && voiceConnected.load(std::memory_order_acquire))
   {
-    audio::PlaybackController controller{
-      .shouldStop = [] { return musicQueue.shouldStop(); },
-      .isPaused = [] { return musicQueue.isPaused(); },
-      .waitWhilePaused = [] { return musicQueue.waitWhilePaused(); },
-    };
-    audio::AudioStreamer streamer(voiceClient, info.streamUrl, info.title, std::move(controller));
-    streamer.start();
-  }
-  catch (const std::exception& e)
-  {
-    logging::error("Audio streaming error: {}", e.what());
-    bot->message_create(dpp::message()
-                          .set_channel_id(botChannelId())
-                          .set_content(std::format("❌ Playback error: {}", e.what())));
+    bot->message_create(
+      dpp::message()
+        .set_channel_id(botChannelId())
+        .set_content("❌ Failed to play track after multiple attempts"));
   }
 
   {
@@ -175,21 +260,28 @@ void streamAudio(dpp::discord_voice_client* voiceClient, const QueueItem& item)
   }
 }
 
-void voiceSessionLoop(dpp::discord_voice_client* voiceClient, const dpp::snowflake guildId)
+void voiceSessionLoop(const dpp::snowflake guildId)
 {
   logging::info("Voice session started for guild {}", static_cast<uint64_t>(guildId));
 
   voiceSessionStart.store(std::chrono::steady_clock::now(), std::memory_order_release);
   totalPlayTime.store(std::chrono::steady_clock::duration::zero(), std::memory_order_release);
 
-  while (!shutdownRequested.load(std::memory_order_acquire))
+  while (!shutdownRequested.load(std::memory_order_acquire)
+         && voiceConnected.load(std::memory_order_acquire))
   {
     auto item = musicQueue.waitForItem(std::chrono::seconds(30));
 
     if (item)
     {
-      streamAudio(voiceClient, *item);
+      streamAudio(*item);
       continue;
+    }
+
+    if (!voiceConnected.load(std::memory_order_acquire))
+    {
+      logging::info("Voice connection lost, exiting session loop");
+      break;
     }
 
     auto idleTime = std::chrono::steady_clock::now() - musicQueue.lastActivityTime();
@@ -205,9 +297,16 @@ void voiceSessionLoop(dpp::discord_voice_client* voiceClient, const dpp::snowfla
     }
   }
 
-  if (auto* shard = currentShard.load(std::memory_order_acquire))
+  if (voiceConnected.load(std::memory_order_acquire))
   {
-    shard->disconnect_voice(guildId);
+    {
+      std::lock_guard lock(voiceClientMutex);
+      activeVoiceClient = nullptr;
+    }
+    if (auto* shard = currentShard.load(std::memory_order_acquire))
+    {
+      shard->disconnect_voice(guildId);
+    }
   }
   voiceConnected.store(false, std::memory_order_release);
   if (bot)
@@ -890,14 +989,43 @@ int main(int argc, char* argv[])
   bot->on_voice_ready([](const dpp::voice_ready_t& event) {
     if (auto* vc = event.voice_client)
     {
+      {
+        std::lock_guard lock(voiceClientMutex);
+        activeVoiceClient = vc;
+      }
       voiceConnected.store(true, std::memory_order_release);
+      logging::info("Voice client set (ptr={})", static_cast<void*>(vc));
+
+      musicQueue.resetForNewSession();
       auto guildId = currentGuildId.load(std::memory_order_acquire);
 
       if (voiceSessionThread.joinable())
       {
         voiceSessionThread.join();
       }
-      voiceSessionThread = std::jthread(voiceSessionLoop, vc, guildId);
+      voiceSessionThread = std::jthread(voiceSessionLoop, guildId);
+    }
+  });
+
+  bot->on_voice_state_update([](const dpp::voice_state_update_t& event) {
+    if (event.state.user_id == bot->me.id)
+    {
+      if (!event.state.channel_id)
+      {
+        logging::info("Bot disconnected from voice channel");
+        voiceConnected.store(false, std::memory_order_release);
+        {
+          std::lock_guard lock(voiceClientMutex);
+          activeVoiceClient = nullptr;
+        }
+        musicQueue.setDisconnected(true);
+        musicQueue.requestSkip();
+      }
+      else
+      {
+        // Bot connected or moved to a channel
+        // Could reset disconnected, for now on_voice_ready handles connection
+      }
     }
   });
 
