@@ -55,7 +55,7 @@ MusicQueueManager musicQueue;
 
 std::unique_ptr<dpp::cluster> bot;
 
-std::atomic<dpp::snowflake> currentGuildId{0};
+std::atomic<uint64_t> currentGuildId{0};
 std::atomic<dpp::discord_client*> currentShard{nullptr};
 std::atomic<bool> voiceConnected{false};
 
@@ -72,14 +72,29 @@ std::jthread voiceSessionThread;
 std::mutex voiceClientMutex;
 dpp::discord_voice_client* activeVoiceClient{nullptr};
 
+std::atomic<uint64_t> activeResponseChannel{0};
+
 [[nodiscard]] inline const config::BotConfig& botConfig()
 {
   return config::getConfig().bot();
 }
 
-[[nodiscard]] inline dpp::snowflake botChannelId()
+[[nodiscard]] inline bool isCommandChannel(dpp::snowflake id)
 {
-  return dpp::snowflake(botConfig().botChannelId);
+  const auto& ids = botConfig().commandChannelIds;
+  const auto& constId = std::as_const(id);
+  return std::ranges::find(ids, static_cast<uint64_t>(constId)) != ids.end();
+}
+
+[[nodiscard]] inline dpp::snowflake responseChannelFor(dpp::snowflake sourceChannel)
+{
+  const auto configured = botConfig().responseChannelId;
+  return configured != 0 ? dpp::snowflake(configured) : sourceChannel;
+}
+
+[[nodiscard]] inline dpp::snowflake responseChannel()
+{
+  return dpp::snowflake(activeResponseChannel.load(std::memory_order_acquire));
 }
 
 }  // namespace
@@ -124,7 +139,7 @@ void streamAudio(const QueueItem& item)
       if (attempt == MAX_RETRIES)
       {
         bot->message_create(dpp::message()
-                              .set_channel_id(botChannelId())
+                              .set_channel_id(responseChannel())
                               .set_content(std::format("❌ Error: {}", result.error())));
       }
       continue;
@@ -141,16 +156,16 @@ void streamAudio(const QueueItem& item)
       }
       if (bot)
       {
-        std::string pres = info.title;
-        if (pres.size() > 120)
+        std::string presenceText = info.title;
+        if (presenceText.size() > 120)
         {
-          pres = pres.substr(0, 117) + "...";
+          presenceText = presenceText.substr(0, 117) + "...";
         }
-        bot->set_presence(dpp::presence(dpp::ps_online, dpp::at_listening, pres));
+        bot->set_presence(dpp::presence(dpp::ps_online, dpp::at_listening, presenceText));
       }
 
       bot->message_create(dpp::message()
-                            .set_channel_id(botChannelId())
+                            .set_channel_id(responseChannel())
                             .set_content(std::format(
                               "🎵 Now playing: '{}'\n{} {}",
                               info.title,
@@ -178,10 +193,9 @@ void streamAudio(const QueueItem& item)
           {
             return false;
           }
-          // send_now=true: bypass DPP's internal outbuf/write_ready() path and call udp_send() (sendto) directly.  
-          // DPP's internal drain loop can get stuck after a voice reconnect, so we send the encrypted RTP packet ourselves.  
-          // Our own 20 ms timing in the consumer loop handles pacing.
-          activeVoiceClient->send_audio_opus(data, len, 20, true);
+          // send_now=false because write_ready() unconditionally re-sets WANT_WRITE 
+          // and causes 100% CPU spin due to EPOLLOUT spinning on empty buffer
+          activeVoiceClient->send_audio_opus(data, len, 20, false);
           return true;
         },
         .tryStopAudio = [] {
@@ -226,7 +240,7 @@ void streamAudio(const QueueItem& item)
       if (attempt == MAX_RETRIES)
       {
         bot->message_create(dpp::message()
-                              .set_channel_id(botChannelId())
+                              .set_channel_id(responseChannel())
                               .set_content(std::format("❌ Playback error: {}", e.what())));
       }
     }
@@ -236,7 +250,7 @@ void streamAudio(const QueueItem& item)
   {
     bot->message_create(
       dpp::message()
-        .set_channel_id(botChannelId())
+        .set_channel_id(responseChannel())
         .set_content("❌ Failed to play track after multiple attempts"));
   }
 
@@ -290,7 +304,7 @@ void voiceSessionLoop(const dpp::snowflake guildId)
       logging::info("Idle timeout reached, disconnecting from voice");
       bot->message_create(
         dpp::message()
-          .set_channel_id(botChannelId())
+          .set_channel_id(responseChannel())
           .set_content(
             std::format("👋 Disconnecting due to inactivity {}", botConfig().botReactionImage)));
       break;
@@ -364,7 +378,7 @@ void handlePlayCommand(
   if (!sanitized)
   {
     bot->message_create(dpp::message()
-                          .set_channel_id(botChannelId())
+                          .set_channel_id(responseChannel())
                           .set_content(sanitized.error()));
     return;
   }
@@ -383,7 +397,7 @@ void handlePlayCommand(
   if (it == guild->voice_members.end())
   {
     bot->message_create(dpp::message()
-                          .set_channel_id(botChannelId())
+                          .set_channel_id(responseChannel())
                           .set_content("❌ You must be in a voice channel to use this command"));
     return;
   }
@@ -395,7 +409,7 @@ void handlePlayCommand(
     if (playlist->videoUrls.empty())
     {
       bot->message_create(dpp::message()
-                            .set_channel_id(botChannelId())
+                            .set_channel_id(responseChannel())
                             .set_content("❌ Playlist is empty or couldn't be loaded"));
       return;
     }
@@ -426,7 +440,7 @@ void handlePlayCommand(
         musicQueue.enqueueBatch(std::move(items));
       }
       bot->message_create(dpp::message()
-                            .set_channel_id(botChannelId())
+                            .set_channel_id(responseChannel())
                             .set_content(std::format(
                               "📝 Added {} tracks from '{}' to {}",
                               count,
@@ -444,17 +458,17 @@ void handlePlayCommand(
         musicQueue.enqueueBatch(std::move(items));
       }
 
-      if (auto* shard = event.from)
+      if (auto* shard = event.from())
       {
         currentShard.store(shard, std::memory_order_release);
-        currentGuildId.store(msg.guild_id, std::memory_order_release);
+        currentGuildId.store(static_cast<uint64_t>(msg.guild_id), std::memory_order_release);
         logging::debug("Initiating voice connection");
-        shard->connect_voice(msg.guild_id, channelId, false, false, false);
+        shard->connect_voice(msg.guild_id, channelId, false, false, true);
       }
 
       bot->message_create(
         dpp::message()
-          .set_channel_id(botChannelId())
+          .set_channel_id(responseChannel())
           .set_content(std::format(
             "🎵 Starting playlist '{}' with {} tracks", playlist->playlistTitle, count)));
     }
@@ -474,14 +488,14 @@ void handlePlayCommand(
     {
       musicQueue.enqueueAtFront(std::move(item));
       bot->message_create(
-        dpp::message().set_channel_id(botChannelId()).set_content("📝 Added to front of queue"));
+        dpp::message().set_channel_id(responseChannel()).set_content("📝 Added to front of queue"));
     }
     else
     {
       musicQueue.enqueue(std::move(item));
       bot->message_create(
         dpp::message()
-          .set_channel_id(botChannelId())
+          .set_channel_id(responseChannel())
           .set_content(std::format("📝 Added to queue (position {})", musicQueue.size())));
     }
   }
@@ -489,12 +503,12 @@ void handlePlayCommand(
   {
     musicQueue.enqueue(std::move(item));
 
-    if (auto* shard = event.from)
+    if (auto* shard = event.from())
     {
       currentShard.store(shard, std::memory_order_release);
-      currentGuildId.store(msg.guild_id, std::memory_order_release);
+      currentGuildId.store(static_cast<uint64_t>(msg.guild_id), std::memory_order_release);
       logging::debug("Initiating voice connection");
-      shard->connect_voice(msg.guild_id, channelId, false, false, false);
+      shard->connect_voice(msg.guild_id, channelId, false, false, true);
     }
   }
 }
@@ -504,12 +518,12 @@ void handleSkipCommand(const dpp::message_create_t& /*event*/)
   if (!musicQueue.isPlaying())
   {
     bot->message_create(
-      dpp::message().set_channel_id(botChannelId()).set_content("❌ Nothing is playing"));
+      dpp::message().set_channel_id(responseChannel()).set_content("❌ Nothing is playing"));
     return;
   }
 
   musicQueue.requestSkip();
-  bot->message_create(dpp::message().set_channel_id(botChannelId()).set_content("⏭️ Skipping..."));
+  bot->message_create(dpp::message().set_channel_id(responseChannel()).set_content("⏭️ Skipping..."));
 }
 
 void handleQueueCommand(const dpp::message_create_t& /*event*/, std::string_view args)
@@ -518,7 +532,7 @@ void handleQueueCommand(const dpp::message_create_t& /*event*/, std::string_view
   if (queueSize == 0 && !musicQueue.isPlaying())
   {
     bot->message_create(
-      dpp::message().set_channel_id(botChannelId()).set_content("📭 Queue is empty"));
+      dpp::message().set_channel_id(responseChannel()).set_content("📭 Queue is empty"));
     return;
   }
 
@@ -543,7 +557,7 @@ void handleQueueCommand(const dpp::message_create_t& /*event*/, std::string_view
   {
     bot->message_create(
       dpp::message()
-        .set_channel_id(botChannelId())
+        .set_channel_id(responseChannel())
         .set_content(std::format("❌ Page {} doesn't exist (max: {})", page, totalPages)));
     return;
   }
@@ -579,7 +593,7 @@ void handleQueueCommand(const dpp::message_create_t& /*event*/, std::string_view
       botConfig().commandPrefix);
   }
 
-  bot->message_create(dpp::message().set_channel_id(botChannelId()).set_content(content));
+  bot->message_create(dpp::message().set_channel_id(responseChannel()).set_content(content));
 }
 
 void handleStopCommand(const dpp::message_create_t& /*event*/)
@@ -589,7 +603,7 @@ void handleStopCommand(const dpp::message_create_t& /*event*/)
   musicQueue.requestSkip();
 
   bot->message_create(dpp::message()
-                        .set_channel_id(botChannelId())
+                        .set_channel_id(responseChannel())
                         .set_content("⏹️ Stopped playback and cleared queue"));
 }
 
@@ -598,19 +612,19 @@ void handlePauseCommand(const dpp::message_create_t& /*event*/)
   if (!musicQueue.isPlaying())
   {
     bot->message_create(
-      dpp::message().set_channel_id(botChannelId()).set_content("❌ Nothing is playing"));
+      dpp::message().set_channel_id(responseChannel()).set_content("❌ Nothing is playing"));
     return;
   }
 
   if (musicQueue.isPaused())
   {
     bot->message_create(
-      dpp::message().set_channel_id(botChannelId()).set_content("⏸️ Already paused"));
+      dpp::message().set_channel_id(responseChannel()).set_content("⏸️ Already paused"));
     return;
   }
 
   musicQueue.setPaused(true);
-  bot->message_create(dpp::message().set_channel_id(botChannelId()).set_content("⏸️ Paused"));
+  bot->message_create(dpp::message().set_channel_id(responseChannel()).set_content("⏸️ Paused"));
 }
 
 void handleResumeCommand(const dpp::message_create_t& /*event*/)
@@ -618,18 +632,18 @@ void handleResumeCommand(const dpp::message_create_t& /*event*/)
   if (!musicQueue.isPlaying())
   {
     bot->message_create(
-      dpp::message().set_channel_id(botChannelId()).set_content("❌ Nothing is playing"));
+      dpp::message().set_channel_id(responseChannel()).set_content("❌ Nothing is playing"));
     return;
   }
 
   if (!musicQueue.isPaused())
   {
-    bot->message_create(dpp::message().set_channel_id(botChannelId()).set_content("▶️ Not paused"));
+    bot->message_create(dpp::message().set_channel_id(responseChannel()).set_content("▶️ Not paused"));
     return;
   }
 
   musicQueue.setPaused(false);
-  bot->message_create(dpp::message().set_channel_id(botChannelId()).set_content("▶️ Resumed"));
+  bot->message_create(dpp::message().set_channel_id(responseChannel()).set_content("▶️ Resumed"));
 }
 
 void handleClearCommand(const dpp::message_create_t& /*event*/)
@@ -640,12 +654,12 @@ void handleClearCommand(const dpp::message_create_t& /*event*/)
   if (cleared == 0)
   {
     bot->message_create(
-      dpp::message().set_channel_id(botChannelId()).set_content("📭 Queue was already empty"));
+      dpp::message().set_channel_id(responseChannel()).set_content("📭 Queue was already empty"));
   }
   else
   {
     bot->message_create(dpp::message()
-                          .set_channel_id(botChannelId())
+                          .set_channel_id(responseChannel())
                           .set_content(std::format("🗑️ Cleared {} items from queue", cleared)));
   }
 }
@@ -662,14 +676,14 @@ void handleShuffleCommand(const dpp::message_create_t& /*event*/)
   if (queueSize < 2)
   {
     bot->message_create(dpp::message()
-                          .set_channel_id(botChannelId())
+                          .set_channel_id(responseChannel())
                           .set_content("❌ Need at least 2 items in queue to shuffle"));
     return;
   }
 
   musicQueue.shuffle();
   bot->message_create(dpp::message()
-                        .set_channel_id(botChannelId())
+                        .set_channel_id(responseChannel())
                         .set_content(std::format("🔀 Shuffled {} items in queue", queueSize)));
 }
 
@@ -698,7 +712,7 @@ void handleUptimeCommand(const dpp::message_create_t& /*event*/)
       formatDuration(totalPlay));
   }
 
-  bot->message_create(dpp::message().set_channel_id(botChannelId()).set_content(content));
+  bot->message_create(dpp::message().set_channel_id(responseChannel()).set_content(content));
 }
 
 void handleRemoveCommand(const dpp::message_create_t& /*event*/, std::string_view args)
@@ -706,7 +720,7 @@ void handleRemoveCommand(const dpp::message_create_t& /*event*/, std::string_vie
   if (args.empty())
   {
     bot->message_create(dpp::message()
-                          .set_channel_id(botChannelId())
+                          .set_channel_id(responseChannel())
                           .set_content(std::format(
                             "Usage: `{}remove <position>` or `{}remove <start> <end>` for range",
                             botConfig().commandPrefix,
@@ -728,7 +742,7 @@ void handleRemoveCommand(const dpp::message_create_t& /*event*/, std::string_vie
     catch (...)
     {
       bot->message_create(
-        dpp::message().set_channel_id(botChannelId()).set_content("❌ Invalid range"));
+        dpp::message().set_channel_id(responseChannel()).set_content("❌ Invalid range"));
       return;
     }
 
@@ -736,13 +750,13 @@ void handleRemoveCommand(const dpp::message_create_t& /*event*/, std::string_vie
     if (removed == 0)
     {
       bot->message_create(dpp::message()
-                            .set_channel_id(botChannelId())
+                            .set_channel_id(responseChannel())
                             .set_content("❌ Invalid range or queue is empty"));
     }
     else
     {
       bot->message_create(dpp::message()
-                            .set_channel_id(botChannelId())
+                            .set_channel_id(responseChannel())
                             .set_content(std::format(
                               "🗑️ Removed {} items (positions {}-{})", removed, startPos, endPos)));
     }
@@ -756,20 +770,20 @@ void handleRemoveCommand(const dpp::message_create_t& /*event*/, std::string_vie
     catch (...)
     {
       bot->message_create(
-        dpp::message().set_channel_id(botChannelId()).set_content("❌ Invalid position"));
+        dpp::message().set_channel_id(responseChannel()).set_content("❌ Invalid position"));
       return;
     }
 
     if (musicQueue.remove(startPos))
     {
       bot->message_create(dpp::message()
-                            .set_channel_id(botChannelId())
+                            .set_channel_id(responseChannel())
                             .set_content(std::format("🗑️ Removed item at position {}", startPos)));
     }
     else
     {
       bot->message_create(dpp::message()
-                            .set_channel_id(botChannelId())
+                            .set_channel_id(responseChannel())
                             .set_content("❌ Invalid position or queue is empty"));
     }
   }
@@ -781,7 +795,7 @@ void handleMoveCommand(const dpp::message_create_t& /*event*/, std::string_view 
   {
     bot->message_create(
       dpp::message()
-        .set_channel_id(botChannelId())
+        .set_channel_id(responseChannel())
         .set_content(std::format("Usage: `{}move <from> <to>`", botConfig().commandPrefix)));
     return;
   }
@@ -791,7 +805,7 @@ void handleMoveCommand(const dpp::message_create_t& /*event*/, std::string_view 
   {
     bot->message_create(
       dpp::message()
-        .set_channel_id(botChannelId())
+        .set_channel_id(responseChannel())
         .set_content(std::format("Usage: `{}move <from> <to>`", botConfig().commandPrefix)));
     return;
   }
@@ -807,7 +821,7 @@ void handleMoveCommand(const dpp::message_create_t& /*event*/, std::string_view 
   catch (...)
   {
     bot->message_create(
-      dpp::message().set_channel_id(botChannelId()).set_content("❌ Invalid positions"));
+      dpp::message().set_channel_id(responseChannel()).set_content("❌ Invalid positions"));
     return;
   }
 
@@ -815,13 +829,13 @@ void handleMoveCommand(const dpp::message_create_t& /*event*/, std::string_view 
   {
     bot->message_create(
       dpp::message()
-        .set_channel_id(botChannelId())
+        .set_channel_id(responseChannel())
         .set_content(std::format("↕️ Moved item from position {} to {}", fromPos, toPos)));
   }
   else
   {
     bot->message_create(dpp::message()
-                          .set_channel_id(botChannelId())
+                          .set_channel_id(responseChannel())
                           .set_content("❌ Invalid positions or queue is empty"));
   }
 }
@@ -853,21 +867,21 @@ void handleNowPlayingCommand(const dpp::message_create_t& /*event*/)
   if (title.empty())
   {
     bot->message_create(
-      dpp::message().set_channel_id(botChannelId()).set_content("📭 Nothing is playing or queued"));
+      dpp::message().set_channel_id(responseChannel()).set_content("📭 Nothing is playing or queued"));
     return;
   }
 
   if (playing)
   {
     bot->message_create(dpp::message()
-                          .set_channel_id(botChannelId())
+                          .set_channel_id(responseChannel())
                           .set_content(std::format(
                             "🎧 Now playing: '{}' • elapsed: {}", title, formatDuration(elapsed))));
   }
   else
   {
     bot->message_create(dpp::message()
-                          .set_channel_id(botChannelId())
+                          .set_channel_id(responseChannel())
                           .set_content(std::format("🎧 Next: '{}'", title)));
   }
 }
@@ -889,13 +903,24 @@ int main(int argc, char* argv[])
   config::setGlobalConfig(std::move(*configResult));
   logging::info("Config loaded from: {}", configPath);
 
+  // Prefer the dedicated response channel fall back to the first command channel.
+  if (botConfig().responseChannelId != 0)
+  {
+    activeResponseChannel.store(botConfig().responseChannelId, std::memory_order_relaxed);
+  }
+  else if (!botConfig().commandChannelIds.empty())
+  {
+    activeResponseChannel.store(
+      botConfig().commandChannelIds.front(), std::memory_order_relaxed);
+  }
+
   std::signal(SIGINT, signalHandler);
   std::signal(SIGTERM, signalHandler);
 
   botStartTime = std::chrono::steady_clock::now();
 
   bot = std::make_unique<dpp::cluster>(
-    botConfig().botToken, dpp::i_all_intents | dpp::i_message_content);
+    botConfig().botToken, dpp::i_default_intents | dpp::i_message_content);
 
   bot->on_log(dpp::utility::cout_logger());
 
@@ -908,7 +933,7 @@ int main(int argc, char* argv[])
   bot->on_message_create([](const dpp::message_create_t& event) {
     const auto& msg = event.msg;
 
-    if (msg.channel_id != botChannelId())
+    if (!isCommandChannel(msg.channel_id))
     {
       return;
     }
@@ -919,6 +944,10 @@ int main(int argc, char* argv[])
     {
       return;
     }
+
+    const dpp::snowflake respChannel = responseChannelFor(msg.channel_id);
+    activeResponseChannel.store(
+      static_cast<uint64_t>(std::as_const(respChannel)), std::memory_order_release);
 
     musicQueue.updateActivity();
 
@@ -997,7 +1026,7 @@ int main(int argc, char* argv[])
       logging::info("Voice client set (ptr={})", static_cast<void*>(vc));
 
       musicQueue.resetForNewSession();
-      auto guildId = currentGuildId.load(std::memory_order_acquire);
+      auto guildId = dpp::snowflake(currentGuildId.load(std::memory_order_acquire));
 
       if (voiceSessionThread.joinable())
       {
@@ -1029,7 +1058,7 @@ int main(int argc, char* argv[])
     }
   });
 
-  bot->start(dpp::st_return != 0U);
+  bot->start(dpp::st_return);
 
   {
     std::unique_lock lock(shutdownMutex);
@@ -1044,6 +1073,22 @@ int main(int argc, char* argv[])
   if (voiceSessionThread.joinable())
   {
     voiceSessionThread.join();
+  }
+
+  dpp::discord_client* shutdownShard = currentShard.load(std::memory_order_acquire);
+
+  if (voiceConnected.exchange(false, std::memory_order_acq_rel))
+  {
+    auto guildId = dpp::snowflake(currentGuildId.load(std::memory_order_acquire));
+    if (shutdownShard)
+    {
+      shutdownShard->disconnect_voice(guildId);
+    }
+  }
+  
+  if (shutdownShard)
+  {
+    shutdownShard->send_close_packet();
   }
 
   bot->shutdown();

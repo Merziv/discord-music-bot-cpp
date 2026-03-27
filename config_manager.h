@@ -5,6 +5,7 @@
 #include <expected>
 #include <string>
 #include <string_view>
+#include <vector>
 
 namespace config {
 
@@ -14,7 +15,8 @@ struct BotConfig
   std::string startupMessage;
   std::string statusPlayingGame;
   std::string commandPrefix;
-  uint64_t botChannelId{0};
+  std::vector<uint64_t> commandChannelIds;
+  uint64_t responseChannelId{0};
   std::string botReactionImage;
   std::chrono::minutes idleTimeout{5};
 };

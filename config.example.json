@@ -4,7 +4,14 @@
     "startup_message": "Bot is now online!",
     "status_playing_game": "Music",
     "command_prefix": "!",
-    "channel_id": 123456789012345678,
+    "_comment_channels": "command_channel_ids / response_channel_id accept either plain values or labeled objects for readability",
+    "command_channel_ids": {
+      "music-commands": 123456789012345678,
+      "testing": 987654321098765432
+    },
+    "response_channel_id": {
+      "bot-spam": 123456789012345678
+    },
     "reaction_image": "🎵",
     "idle_timeout_minutes": 5
   }

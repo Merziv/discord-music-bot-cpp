@@ -176,13 +176,13 @@ void AudioStreamer::producerLoop(const std::stop_token& stopToken)
          && !_controller.shouldStop())
   {
     struct pollfd pfd = {.fd = fd, .events = POLLIN, .revents = 0};
-    int ret = poll(&pfd, 1, POLL_TIMEOUT_MS);
+    int pollResult = poll(&pfd, 1, POLL_TIMEOUT_MS);
 
-    if (ret == 0)
+    if (pollResult == 0)
     {
       continue;
     }
-    if (ret < 0)
+    if (pollResult < 0)
     {
       if (errno == EINTR)
       {

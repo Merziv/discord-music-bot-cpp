@@ -56,6 +56,83 @@ std::optional<ConfigManager> g_globalConfig;
   return nullptr;
 }
 
+// Accepts either:
+//   "key": [123, 456]                          — plain array of IDs
+//   "key": { "label1": 123, "label2": 456 }  — object with descriptive keys (values are IDs)
+[[nodiscard]] std::vector<uint64_t> getUint64Array(const rapidjson::Value& obj, const char* key)
+{
+  std::vector<uint64_t> result;
+  if (!obj.HasMember(key))
+  {
+    return result;
+  }
+  const auto& val = obj[key];
+  if (val.IsArray())
+  {
+    for (const auto& elem : val.GetArray())
+    {
+      if (elem.IsUint64())
+      {
+        result.push_back(elem.GetUint64());
+      }
+      else if (elem.IsInt64())
+      {
+        result.push_back(static_cast<uint64_t>(elem.GetInt64()));
+      }
+    }
+  }
+  else if (val.IsObject())
+  {
+    for (auto it = val.MemberBegin(); it != val.MemberEnd(); ++it)
+    {
+      if (it->value.IsUint64())
+      {
+        result.push_back(it->value.GetUint64());
+      }
+      else if (it->value.IsInt64())
+      {
+        result.push_back(static_cast<uint64_t>(it->value.GetInt64()));
+      }
+    }
+  }
+  return result;
+}
+
+// Accepts either:
+//   "key": 123                     — plain number
+//   "key": { "label": 123 }       — object with one descriptive key (value is the ID)
+[[nodiscard]] std::optional<uint64_t> getAnnotatedUint64(const rapidjson::Value& obj, const char* key)
+{
+  if (!obj.HasMember(key))
+  {
+    return std::nullopt;
+  }
+  const auto& val = obj[key];
+  if (val.IsUint64())
+  {
+    return val.GetUint64();
+  }
+  if (val.IsInt64())
+  {
+    return static_cast<uint64_t>(val.GetInt64());
+  }
+  if (val.IsObject())
+  {
+    for (auto it = val.MemberBegin(); it != val.MemberEnd(); ++it)
+    {
+      if (it->value.IsUint64())
+      {
+        return it->value.GetUint64();
+      }
+      if (it->value.IsInt64())
+      {
+        return static_cast<uint64_t>(it->value.GetInt64());
+      }
+    }
+  }
+  return std::nullopt;
+}
+
 }  // namespace
 
 std::expected<ConfigManager, std::string> ConfigManager::loadFromFile(std::string_view filePath)
@@ -127,13 +204,23 @@ std::expected<ConfigManager, std::string> ConfigManager::loadFromFile(std::strin
       cfg.bot.commandPrefix = "!";
     }
 
-    if (auto val = getUint64(*botSection, "channel_id"))
+    auto channelIds = getUint64Array(*botSection, "command_channel_ids");
+    if (!channelIds.empty())
     {
-      cfg.bot.botChannelId = *val;
+      cfg.bot.commandChannelIds = std::move(channelIds);
+    }
+    else if (auto val = getUint64(*botSection, "channel_id"))
+    {
+      cfg.bot.commandChannelIds = {*val};
     }
     else
     {
-      return std::unexpected("Missing required field: bot.channel_id");
+      return std::unexpected("Missing required field: bot.command_channel_ids (or bot.channel_id)");
+    }
+
+    if (auto val = getAnnotatedUint64(*botSection, "response_channel_id"))
+    {
+      cfg.bot.responseChannelId = *val;
     }
 
     if (auto val = getString(*botSection, "reaction_image"))

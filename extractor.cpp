@@ -23,16 +23,16 @@ namespace {
 
   std::string output;
   output.reserve(16384);
-  std::array<char, 8192> buf{};
+  std::array<char, 8192> readBuffer{};
 
   while (true)
   {
-    const size_t n = std::fread(buf.data(), 1, buf.size(), pipe);
+    const size_t n = std::fread(readBuffer.data(), 1, readBuffer.size(), pipe);
     if (n > 0)
     {
-      output.append(buf.data(), n);
+      output.append(readBuffer.data(), n);
     }
-    if (n < buf.size())
+    if (n < readBuffer.size())
     {
       if (std::feof(pipe) != 0 || std::ferror(pipe) != 0)
       {
@@ -51,14 +51,14 @@ namespace {
 
 [[nodiscard]] std::string shellQuote(std::string_view str)
 {
-  std::string out;
-  out.reserve(str.size() + 10);
-  out.push_back('\'');
+  std::string quotedOutput;
+  quotedOutput.reserve(str.size() + 10);
+  quotedOutput.push_back('\'');
   for (char c : str)
   {
     if (c == '\'')
     {
-      out += "'\\''";
+      quotedOutput += "'\\''";
     }
     else if (c == '\0')
     {
@@ -66,11 +66,11 @@ namespace {
     }
     else
     {
-      out.push_back(c);
+      quotedOutput.push_back(c);
     }
   }
-  out.push_back('\'');
-  return out;
+  quotedOutput.push_back('\'');
+  return quotedOutput;
 }
 
 namespace json {
@@ -135,7 +135,7 @@ namespace json {
   }
 
   const rapidjson::Value* best = nullptr;
-  double bestAbr = -1.0;
+  double bestBitrate = -1.0;
 
   for (const auto& f : formats.GetArray())
   {
@@ -152,10 +152,10 @@ namespace json {
       continue;
     }
 
-    const double abr = json::getDouble(f, "abr").value_or(-1.0);
-    if (abr > bestAbr)
+    const double audioBitrate = json::getDouble(f, "abr").value_or(-1.0);
+    if (audioBitrate > bestBitrate)
     {
-      bestAbr = abr;
+      bestBitrate = audioBitrate;
       best = &f;
     }
   }
@@ -175,10 +175,10 @@ namespace json {
         continue;
       }
 
-      const double abr = json::getDouble(f, "abr").value_or(-1.0);
-      if (abr > bestAbr)
+      const double audioBitrate = json::getDouble(f, "abr").value_or(-1.0);
+      if (audioBitrate > bestBitrate)
       {
-        bestAbr = abr;
+        bestBitrate = audioBitrate;
         best = &f;
       }
     }
@@ -268,9 +268,9 @@ std::expected<ExtractedInfo, std::string> extractStreamInfo(std::string_view que
                         .value_or("");
     info.isLive = json::getBool(leaf, "is_live").value_or(false);
 
-    if (auto dur = json::getDouble(leaf, "duration"))
+    if (auto durationSeconds = json::getDouble(leaf, "duration"))
     {
-      info.durationSec = static_cast<int64_t>(*dur);
+      info.durationSec = static_cast<int64_t>(*durationSeconds);
     }
 
     if (auto url = json::getString(leaf, "url"); url && !url->empty())
