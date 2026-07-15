@@ -11,6 +11,7 @@ add_executable(music_bot
   main.cpp
   config_manager.cpp
   audio_streamer.cpp
+  audio_decoder.cpp
   extractor.cpp
 )
 
@@ -60,11 +61,15 @@ FetchContent_MakeAvailable(dpp)
 
 find_package(Opus REQUIRED)
 find_package(RapidJSON REQUIRED)
+find_package(CURL REQUIRED)
+find_package(ffmpeg REQUIRED)
 
 target_link_libraries(music_bot PRIVATE
   dpp
   Opus::opus
   rapidjson
+  CURL::libcurl
+  ffmpeg::ffmpeg
 )
 
 # Suppress warnings from DPP headers -Wshadow issues

@@ -9,6 +9,14 @@
 
 namespace config {
 
+enum class LogLevel : std::uint8_t
+{
+  Debug,
+  Info,
+  Warn,
+  Error
+};
+
 struct BotConfig
 {
   std::string botToken;
@@ -19,6 +27,8 @@ struct BotConfig
   uint64_t responseChannelId{0};
   std::string botReactionImage;
   std::chrono::minutes idleTimeout{5};
+  std::chrono::seconds gatewayReconnectTimeout{std::chrono::minutes(3)};
+  LogLevel logLevel{LogLevel::Info};
 };
 
 struct AppConfig

@@ -1,12 +1,11 @@
 #include "audio_streamer.h"
 
-#include <cerrno>
-#include <csignal>
-#include <cstring>
-#include <fcntl.h>
-#include <poll.h>
-#include <sys/wait.h>
-#include <unistd.h>
+#include "audio_decoder.h"
+
+#include <algorithm>
+#include <chrono>
+#include <stdexcept>
+#include <thread>
 #include <vector>
 
 namespace audio {
@@ -14,9 +13,13 @@ namespace audio {
 AudioStreamer::AudioStreamer(
   std::string streamUrl,
   std::string title,
+  bool isLive,
+  StreamRefreshCallback refreshStreamUrl,
   PlaybackController controller)
   : _streamUrl(std::move(streamUrl))
   , _title(std::move(title))
+  , _isLive(isLive)
+  , _refreshStreamUrl(std::move(refreshStreamUrl))
   , _controller(std::move(controller))
 {
   initEncoder();
@@ -29,6 +32,11 @@ AudioStreamer::~AudioStreamer()
 
 void AudioStreamer::start()
 {
+  _producerDone.store(false, std::memory_order_release);
+  _shouldStop.store(false, std::memory_order_release);
+  _playedAudio.store(false, std::memory_order_release);
+  _ringBuffer.clear();
+
   _producerThread = std::jthread([this](const std::stop_token& st) { producerLoop(st); });
   consumerLoop();
 }
@@ -36,12 +44,6 @@ void AudioStreamer::start()
 void AudioStreamer::stop()
 {
   _shouldStop.store(true, std::memory_order_release);
-
-  int pid = _ffmpegPid.load(std::memory_order_acquire);
-  if (pid > 0)
-  {
-    ::kill(pid, SIGTERM);
-  }
 
   if (_producerThread.joinable())
   {
@@ -71,201 +73,143 @@ void AudioStreamer::initEncoder()
 
 void AudioStreamer::producerLoop(const std::stop_token& stopToken)
 {
-  const std::string ffmpegErrLog = makeTempLogPath("ffmpeg_audio");
-  const std::string sampleRateStr = std::to_string(SAMPLE_RATE);
-  const std::string channelsStr = std::to_string(CHANNELS);
+  auto shouldAbort = [&] {
+    return stopToken.stop_requested() || _shouldStop.load(std::memory_order_acquire)
+           || _controller.shouldStop();
+  };
 
-  int pipefd[2];
-  if (pipe(pipefd) != 0)
-  {
-    logging::error("Failed to create pipe for ffmpeg");
-    _producerDone.store(true, std::memory_order_release);
-    return;
-  }
-
-  pid_t pid = fork();
-  if (pid < 0)
-  {
-    ::close(pipefd[0]);
-    ::close(pipefd[1]);
-    logging::error("Failed to fork for ffmpeg");
-    _producerDone.store(true, std::memory_order_release);
-    return;
-  }
-
-  if (pid == 0)
-  {
-    ::close(pipefd[0]);
-
-    if (dup2(pipefd[1], STDOUT_FILENO) < 0)
+  auto pushFrame = [&](const AudioFrame& frame) {
+    int spinCount = 0;
+    while (!_ringBuffer.push(frame))
     {
-      _exit(127);
-    }
-    ::close(pipefd[1]);
-
-    int errfd = ::open(ffmpegErrLog.c_str(), O_WRONLY | O_CREAT | O_TRUNC, 0644);
-    if (errfd >= 0)
-    {
-      dup2(errfd, STDERR_FILENO);
-      ::close(errfd);
-    }
-
-    int devnull = ::open("/dev/null", O_RDONLY);
-    if (devnull >= 0)
-    {
-      dup2(devnull, STDIN_FILENO);
-      ::close(devnull);
-    }
-
-    // NOLINTBEGIN(cppcoreguidelines-pro-type-vararg)
-    execlp(
-      "ffmpeg",
-      "ffmpeg",
-      "-hide_banner",
-      "-loglevel",
-      "warning",
-      "-nostdin",
-      "-reconnect",
-      "1",
-      "-reconnect_streamed",
-      "1",
-      "-reconnect_delay_max",
-      "5",
-      "-fflags",
-      "+nobuffer+discardcorrupt",
-      "-flags",
-      "low_delay",
-      "-probesize",
-      "1M",
-      "-analyzeduration",
-      "0",
-      "-i",
-      _streamUrl.c_str(),
-      "-ar",
-      sampleRateStr.c_str(),
-      "-ac",
-      channelsStr.c_str(),
-      "-f",
-      "s16le",
-      "-vn",
-      "pipe:1",
-      static_cast<char*>(nullptr));
-    // NOLINTEND(cppcoreguidelines-pro-type-vararg)
-
-    _exit(127);
-  }
-
-  ::close(pipefd[1]);
-  int fd = pipefd[0];
-
-  fcntl(fd, F_SETPIPE_SZ, 1024 * 1024);
-  _ffmpegPid.store(static_cast<int>(pid), std::memory_order_release);
-
-  logging::debug(
-    "Launched ffmpeg pid={} for '{}', stderr log: {}",
-    static_cast<int>(pid),
-    _title,
-    ffmpegErrLog);
-
-  AudioFrame frame{};
-  size_t frameOffset = 0;
-  std::array<char, 131072> readBuf{};
-  constexpr int POLL_TIMEOUT_MS = 200;
-
-  while (!stopToken.stop_requested() && !_shouldStop.load(std::memory_order_acquire)
-         && !_controller.shouldStop())
-  {
-    struct pollfd pfd = {.fd = fd, .events = POLLIN, .revents = 0};
-    int pollResult = poll(&pfd, 1, POLL_TIMEOUT_MS);
-
-    if (pollResult == 0)
-    {
-      continue;
-    }
-    if (pollResult < 0)
-    {
-      if (errno == EINTR)
+      if (shouldAbort())
       {
-        continue;
+        return false;
       }
-      logging::warn("Poll error on ffmpeg pipe: {}", strerror(errno));
-      break;
-    }
-
-    ssize_t bytesRead = ::read(fd, readBuf.data(), readBuf.size());
-
-    if (bytesRead <= 0)
-    {
-      if (bytesRead == 0)
+      if (++spinCount > 10)
       {
-        logging::info("FFmpeg stream ended");
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        spinCount = 0;
       }
       else
       {
-        logging::warn("Read error from ffmpeg pipe");
+        std::this_thread::yield();
       }
-      break;
     }
+    return true;
+  };
 
+  FFmpegAudioDecoder decoder;
+  AudioFrame frame{};
+  size_t frameOffset = 0;
+  std::string currentStreamUrl = _streamUrl;
+
+  auto onSamples = [&](std::span<const int16_t> samples) -> bool {
     size_t pos = 0;
-    while (pos < static_cast<size_t>(bytesRead))
-    {
-      const size_t frameRemaining = FRAME_BYTES - frameOffset;
-      const size_t available = static_cast<size_t>(bytesRead) - pos;
-      const size_t toCopy = std::min(frameRemaining, available);
 
-      // NOLINTBEGIN(cppcoreguidelines-pro-type-reinterpret-cast)
-      auto* frameBytes = reinterpret_cast<char*>(frame.data());
-      // NOLINTEND(cppcoreguidelines-pro-type-reinterpret-cast)
-      std::memcpy(frameBytes + frameOffset, readBuf.data() + pos, toCopy);
+    while (pos < samples.size())
+    {
+      if (shouldAbort())
+      {
+        return false;
+      }
+
+      const size_t remainingInFrame = static_cast<size_t>(TOTAL_SAMPLES) - frameOffset;
+      const size_t remainingInChunk = samples.size() - pos;
+      const size_t toCopy = std::min(remainingInFrame, remainingInChunk);
+
+      std::copy_n(samples.data() + static_cast<std::ptrdiff_t>(pos),
+                  static_cast<std::ptrdiff_t>(toCopy),
+                  frame.data() + static_cast<std::ptrdiff_t>(frameOffset));
+
       frameOffset += toCopy;
       pos += toCopy;
 
-      if (frameOffset >= static_cast<size_t>(FRAME_BYTES))
+      if (frameOffset >= static_cast<size_t>(TOTAL_SAMPLES))
       {
-        int spinCount = 0;
-        while (!_ringBuffer.push(frame))
+        if (!pushFrame(frame))
         {
-          if (
-            stopToken.stop_requested() || _shouldStop.load(std::memory_order_acquire)
-            || _controller.shouldStop())
-          {
-            break;
-          }
-          if (++spinCount > 10)
-          {
-            std::this_thread::sleep_for(std::chrono::milliseconds(1));
-            spinCount = 0;
-          }
-          else
-          {
-            std::this_thread::yield();
-          }
+          return false;
         }
         frameOffset = 0;
       }
     }
-  }
 
-  ::close(fd);
-  _ffmpegPid.store(-1, std::memory_order_release);
+    return true;
+  };
 
-  ::kill(pid, SIGTERM);
-
-  int status = 0;
-  for (int i = 0; i < 20; ++i)
-  {
-    if (waitpid(pid, &status, WNOHANG) != 0)
+  auto refreshLiveStreamUrl = [&]() -> bool {
+    if (!_isLive || !_refreshStreamUrl || shouldAbort())
     {
-      pid = -1;
+      return false;
+    }
+
+    auto refreshed = _refreshStreamUrl();
+    if (!refreshed)
+    {
+      logging::warn("Failed to refresh live stream URL for '{}': {}", _title, refreshed.error());
+      return false;
+    }
+    if (refreshed->empty())
+    {
+      logging::warn("Live refresh returned an empty stream URL for '{}'", _title);
+      return false;
+    }
+
+    currentStreamUrl = std::move(*refreshed);
+    logging::info("Refreshed live stream URL for '{}'", _title);
+    return true;
+  };
+
+  while (!shouldAbort())
+  {
+    auto decoded = decoder.decode(currentStreamUrl, stopToken, onSamples);
+    if (decoded)
+    {
+      if (!_isLive || shouldAbort())
+      {
+        break;
+      }
+
+      logging::info("Live stream URL ended for '{}', attempting refresh", _title);
+      if (refreshLiveStreamUrl())
+      {
+        continue;
+      }
+
+      logging::warn("Stopping live playback for '{}' after refresh failure", _title);
       break;
     }
-    std::this_thread::sleep_for(std::chrono::milliseconds(50));
+
+    if (shouldAbort())
+    {
+      logging::debug("In-process decoder stopped for '{}': {}", _title, decoded.error());
+      break;
+    }
+
+    if (_isLive)
+    {
+      logging::warn(
+        "Live decoder ended for '{}': {}. Attempting refresh.",
+        _title,
+        decoded.error());
+      if (refreshLiveStreamUrl())
+      {
+        continue;
+      }
+
+      logging::warn("Stopping live playback for '{}' after refresh failure", _title);
+      break;
+    }
+
+    logging::warn("In-process decoder failed for '{}': {}", _title, decoded.error());
+    break;
   }
-  if (pid > 0)
+
+  if (frameOffset > 0 && !shouldAbort())
   {
-    ::kill(pid, SIGKILL);
-    waitpid(pid, &status, 0);
+    std::fill(frame.begin() + static_cast<std::ptrdiff_t>(frameOffset), frame.end(), 0);
+    (void)pushFrame(frame);
   }
 
   _producerDone.store(true, std::memory_order_release);
@@ -275,7 +219,6 @@ void AudioStreamer::producerLoop(const std::stop_token& stopToken)
 void AudioStreamer::consumerLoop()
 {
   using Clock = std::chrono::steady_clock;
-  constexpr auto frameDuration = std::chrono::milliseconds(FRAME_DURATION_MS);
 
   constexpr size_t PREBUFFER_FRAMES = 50;
   constexpr auto PREBUFFER_TIMEOUT = std::chrono::seconds(15);
@@ -322,15 +265,19 @@ void AudioStreamer::consumerLoop()
     }
   }
 
-  // Set overlap audio mode so DPP sends each opus packet immediately via UDP,
-  // bypassing DPP's internal send thread which can get stuck after reconnections.
+  // DPP handles 20ms pacing internally; we keep its send queue filled.
   _controller.configureVoiceClient();
 
+  // 100 frames x 20ms = about 2s ahead.
+  constexpr size_t TARGET_BUFFER_FRAMES = 100;
+
   std::vector<unsigned char> opusBuf(4000);
-  auto nextFrameTime = Clock::now();
   bool stoppedEarly = false;
   size_t sendCount = 0;
   _playedAudio.store(false, std::memory_order_release);
+
+  // Keep the estimated send-ahead near TARGET_BUFFER_FRAMES.
+  auto playbackStart = Clock::now();
 
   while (!_shouldStop.load(std::memory_order_acquire) && !_controller.shouldStop())
   {
@@ -341,7 +288,21 @@ void AudioStreamer::consumerLoop()
         stoppedEarly = true;
         break;
       }
-      nextFrameTime = Clock::now();
+      sendCount = 0;
+      playbackStart = Clock::now();
+    }
+
+    const auto elapsed = Clock::now() - playbackStart;
+    const auto elapsedFrames = static_cast<size_t>(
+      std::chrono::duration_cast<std::chrono::milliseconds>(elapsed).count()
+      / FRAME_DURATION_MS);
+    const size_t estimatedBuffered =
+      (sendCount > elapsedFrames) ? (sendCount - elapsedFrames) : 0;
+
+    if (estimatedBuffered >= TARGET_BUFFER_FRAMES)
+    {
+      std::this_thread::sleep_for(std::chrono::milliseconds(FRAME_DURATION_MS));
+      continue;
     }
 
     auto frameOpt = _ringBuffer.pop();
@@ -385,23 +346,10 @@ void AudioStreamer::consumerLoop()
     if (sendCount % 500 == 1)
     {
       logging::debug(
-        "Audio watchdog: sends={}, ring={}",
+        "Audio watchdog: sends={}, ring={}, dppBuf~={}",
         sendCount,
-        _ringBuffer.size());
-    }
-
-    nextFrameTime += frameDuration;
-    auto now = Clock::now();
-
-    if (nextFrameTime > now)
-    {
-      std::this_thread::sleep_until(nextFrameTime);
-    }
-    else if (now - nextFrameTime > std::chrono::milliseconds(100))
-    {
-      logging::warn("Audio timing reset due to lag (drift={}ms)",
-        std::chrono::duration_cast<std::chrono::milliseconds>(now - nextFrameTime).count());
-      nextFrameTime = now;
+        _ringBuffer.size(),
+        estimatedBuffered);
     }
   }
 
@@ -412,19 +360,6 @@ void AudioStreamer::consumerLoop()
   }
 
   logging::info("Audio consumer finished");
-}
-
-std::string AudioStreamer::makeTempLogPath(const char* prefix)
-{
-  std::string path = std::format("/tmp/{}_XXXXXX.log", prefix);
-  std::vector<char> tmpl(path.begin(), path.end());
-  tmpl.push_back('\0');
-
-  if (int fd = mkstemps(tmpl.data(), 4); fd >= 0)
-  {
-    close(fd);
-  }
-  return {tmpl.data()};
 }
 
 }  // namespace audio

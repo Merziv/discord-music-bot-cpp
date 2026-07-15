@@ -7,6 +7,7 @@
 #include <atomic>
 #include <chrono>
 #include <condition_variable>
+#include <cstdlib>
 #include <csignal>
 #include <dpp/cluster.h>
 #include <dpp/discordclient.h>
@@ -48,15 +49,12 @@ namespace logging = audio::logging;
 
 namespace {
 std::atomic<bool> shutdownRequested{false};
-std::mutex shutdownMutex;
-std::condition_variable shutdownCV;
 
 MusicQueueManager musicQueue;
 
 std::unique_ptr<dpp::cluster> bot;
 
 std::atomic<uint64_t> currentGuildId{0};
-std::atomic<dpp::discord_client*> currentShard{nullptr};
 std::atomic<bool> voiceConnected{false};
 
 std::chrono::steady_clock::time_point botStartTime;
@@ -68,11 +66,89 @@ std::chrono::steady_clock::time_point currentTrackStart{};
 std::mutex playTimeMutex;
 std::string currentTrackTitle;
 std::jthread voiceSessionThread;
+std::atomic<uint64_t> voiceSessionGeneration{0};
 
 std::mutex voiceClientMutex;
 dpp::discord_voice_client* activeVoiceClient{nullptr};
 
+std::mutex voiceSessionMutex;
+
 std::atomic<uint64_t> activeResponseChannel{0};
+std::atomic<bool> initialReadyReceived{false};
+
+// Tracked disconnect threads — joined at shutdown to prevent use-after-free on bot.
+std::mutex disconnectThreadsMutex;
+struct TrackedThread
+{
+  std::jthread thread;
+  std::shared_ptr<std::atomic<bool>> done;
+};
+std::vector<TrackedThread> disconnectThreads;
+
+void scheduleDisconnect(dpp::snowflake gId, uint64_t expectedGeneration)
+{
+  if (!bot)
+  {
+    return;
+  }
+  auto* cluster = bot.get();
+  std::lock_guard lock(disconnectThreadsMutex);
+  // Prune completed threads to avoid unbounded growth.
+  for (auto it = disconnectThreads.begin(); it != disconnectThreads.end(); )
+  {
+    if (it->done->load(std::memory_order_acquire))
+    {
+      if (it->thread.joinable())
+      {
+        it->thread.join();
+      }
+      it = disconnectThreads.erase(it);
+    }
+    else
+    {
+      ++it;
+    }
+  }
+  auto done = std::make_shared<std::atomic<bool>>(false);
+  disconnectThreads.push_back(TrackedThread{
+    .thread = std::jthread([gId, expectedGeneration, cluster, done] {
+      if (voiceSessionGeneration.load(std::memory_order_acquire) != expectedGeneration)
+      {
+        done->store(true, std::memory_order_release);
+        return;
+      }
+      if (auto* shard = cluster->get_shard(0))
+      {
+        shard->disconnect_voice(gId);
+      }
+      done->store(true, std::memory_order_release);
+    }),
+    .done = done,
+  });
+}
+
+void cleanupStaleVoice(std::string_view reason)
+{
+  const auto generation = voiceSessionGeneration.fetch_add(1, std::memory_order_acq_rel) + 1;
+
+  // Use exchange so only one caller performs the cleanup
+  if (!voiceConnected.exchange(false, std::memory_order_acq_rel))
+  {
+    return;
+  }
+  logging::warn("Cleaning up stale voice state: {}", reason);
+  {
+    std::lock_guard lock(voiceClientMutex);
+    activeVoiceClient = nullptr;
+  }
+  musicQueue.setDisconnected(true);
+  musicQueue.requestSkip();
+
+  // Disconnect on a separate thread — disconnect_voice can re-enter
+  // on_voice_ready on the same DPP thread, which would deadlock.
+  auto gId = dpp::snowflake(currentGuildId.load(std::memory_order_acquire));
+  scheduleDisconnect(gId, generation);
+}
 
 [[nodiscard]] inline const config::BotConfig& botConfig()
 {
@@ -97,15 +173,20 @@ std::atomic<uint64_t> activeResponseChannel{0};
   return dpp::snowflake(activeResponseChannel.load(std::memory_order_acquire));
 }
 
+[[nodiscard]] inline bool isActiveVoiceSession(uint64_t expectedGeneration)
+{
+  return voiceConnected.load(std::memory_order_acquire)
+         && voiceSessionGeneration.load(std::memory_order_acquire) == expectedGeneration;
+}
+
 }  // namespace
 
 void signalHandler(int /*signal*/)
 {
   shutdownRequested.store(true, std::memory_order_release);
-  shutdownCV.notify_one();
 }
 
-void streamAudio(const QueueItem& item)
+void streamAudio(const QueueItem& item, uint64_t sessionGeneration)
 {
   logging::info("Starting streamAudio. Query: {}", item.query);
   musicQueue.setPlaying(true);
@@ -117,38 +198,54 @@ void streamAudio(const QueueItem& item)
     isCurrentlyPlaying.store(true, std::memory_order_release);
   }
 
-  constexpr int MAX_RETRIES = 2;
   bool played = false;
+  bool hasLoggedNowPlaying = false;
 
-  for (int attempt = 0; attempt <= MAX_RETRIES; ++attempt)
+  std::vector<std::string> candidates;
+  bool searchFailed = false;
+  try
   {
-    if (attempt > 0)
-    {
-      logging::warn("Retrying stream extraction (attempt {}/{})", attempt + 1, MAX_RETRIES + 1);
-    }
+    candidates = searchCandidateUrls(item.query, shutdownRequested);
+  }
+  catch (const std::exception& e)
+  {
+    logging::error("Failed to search candidates for query '{}': {}", item.query, e.what());
+    searchFailed = true;
+  }
 
-    if (musicQueue.shouldStop() || !voiceConnected.load(std::memory_order_acquire))
+  if (searchFailed && bot)
+  {
+    bot->message_create(
+      dpp::message()
+        .set_channel_id(responseChannel())
+        .set_content(std::format(
+          "\u274c Search failed for `{}`. This may be a network issue or an "
+          "unsupported query format. Please try again.",
+          item.query)));
+  }
+
+  for (size_t ci = 0; ci < candidates.size() && !played; ++ci)
+  {
+    if (shutdownRequested.load(std::memory_order_acquire)
+        || musicQueue.shouldStop() || !isActiveVoiceSession(sessionGeneration))
     {
       break;
     }
 
-    auto result = extractStreamInfo(item.query);
+    const auto& videoUrl = candidates[ci];
+
+    auto result = extractStreamInfo(videoUrl, shutdownRequested);
     if (!result)
     {
-      logging::error("Extractor error: {}", result.error());
-      if (attempt == MAX_RETRIES)
-      {
-        bot->message_create(dpp::message()
-                              .set_channel_id(responseChannel())
-                              .set_content(std::format("❌ Error: {}", result.error())));
-      }
+      logging::warn("Candidate {}/{} failed: {}", ci + 1, candidates.size(), result.error());
       continue;
     }
 
     const auto& info = *result;
 
-    if (attempt == 0)
+    if (!hasLoggedNowPlaying)
     {
+      hasLoggedNowPlaying = true;
       logging::info("Now playing: '{}'", info.title);
       {
         std::lock_guard lock(playTimeMutex);
@@ -174,7 +271,7 @@ void streamAudio(const QueueItem& item)
     }
     else
     {
-      logging::info("Retry playing: '{}'", info.title);
+      logging::info("Trying candidate {}/{}: '{}'", ci + 1, candidates.size(), info.title);
     }
 
     logging::debug(
@@ -183,47 +280,60 @@ void streamAudio(const QueueItem& item)
 
     try
     {
+      const std::string liveRefreshUrl = info.webpageUrl;
       audio::PlaybackController controller{
-        .shouldStop = [] { return musicQueue.shouldStop() || !voiceConnected.load(std::memory_order_acquire); },
+        .shouldStop = [sessionGeneration] {
+          return musicQueue.shouldStop() || !isActiveVoiceSession(sessionGeneration);
+        },
         .isPaused = [] { return musicQueue.isPaused(); },
         .waitWhilePaused = [] { return musicQueue.waitWhilePaused(); },
-        .trySendAudioOpus = [](const uint8_t* data, size_t len) -> bool {
+        .trySendAudioOpus = [sessionGeneration](const uint8_t* data, size_t len) -> bool {
           std::lock_guard lock(voiceClientMutex);
-          if (!activeVoiceClient || !voiceConnected.load(std::memory_order_acquire))
+          if (!activeVoiceClient || !isActiveVoiceSession(sessionGeneration))
           {
             return false;
           }
-          // send_now=false because write_ready() unconditionally re-sets WANT_WRITE 
-          // and causes 100% CPU spin due to EPOLLOUT spinning on empty buffer
           activeVoiceClient->send_audio_opus(data, len, 20, false);
           return true;
         },
-        .tryStopAudio = [] {
+        .tryStopAudio = [sessionGeneration] {
           std::lock_guard lock(voiceClientMutex);
-          if (activeVoiceClient && voiceConnected.load(std::memory_order_acquire))
+          if (activeVoiceClient && isActiveVoiceSession(sessionGeneration))
           {
             activeVoiceClient->stop_audio();
           }
         },
-        .isReady = []() -> bool {
+        .isReady = [sessionGeneration]() -> bool {
           std::lock_guard lock(voiceClientMutex);
           return activeVoiceClient != nullptr
-                 && voiceConnected.load(std::memory_order_acquire)
+                 && isActiveVoiceSession(sessionGeneration)
                  && activeVoiceClient->is_ready();
         },
-        .configureVoiceClient = [] {
+        .configureVoiceClient = [sessionGeneration] {
           std::lock_guard lock(voiceClientMutex);
-          if (activeVoiceClient && voiceConnected.load(std::memory_order_acquire))
+          if (activeVoiceClient && isActiveVoiceSession(sessionGeneration))
           {
-            // frame_size = 48 * duration * (timescale / 1 000 000)
             activeVoiceClient->set_timescale(1000000);
-            // Send the speaking intent before any UDP audio packets
             activeVoiceClient->speak();
-            logging::info("Voice client configured: timescale=1000000, direct UDP send");
+            logging::info("Voice client configured: timescale=1000000, using recorded audio pacing mode");
           }
         },
       };
-      audio::AudioStreamer streamer(info.streamUrl, info.title, std::move(controller));
+      auto refreshLiveStreamUrl = [liveRefreshUrl]() -> std::expected<std::string, std::string> {
+        auto refreshed = extractStreamInfo(liveRefreshUrl, shutdownRequested);
+        if (!refreshed)
+        {
+          return std::unexpected(refreshed.error());
+        }
+        return refreshed->streamUrl;
+      };
+
+      audio::AudioStreamer streamer(
+        info.streamUrl,
+        info.title,
+        info.isLive,
+        refreshLiveStreamUrl,
+        std::move(controller));
       streamer.start();
 
       if (streamer.playedAudio())
@@ -232,21 +342,15 @@ void streamAudio(const QueueItem& item)
         break;
       }
 
-      logging::warn("No audio produced for '{}', will retry with fresh URL", info.title);
+      logging::warn("No audio produced for '{}', trying next candidate", info.title);
     }
     catch (const std::exception& e)
     {
       logging::error("Audio streaming error: {}", e.what());
-      if (attempt == MAX_RETRIES)
-      {
-        bot->message_create(dpp::message()
-                              .set_channel_id(responseChannel())
-                              .set_content(std::format("❌ Playback error: {}", e.what())));
-      }
     }
   }
 
-  if (!played && !musicQueue.shouldStop() && voiceConnected.load(std::memory_order_acquire))
+  if (!played && !musicQueue.shouldStop() && isActiveVoiceSession(sessionGeneration))
   {
     bot->message_create(
       dpp::message()
@@ -274,13 +378,15 @@ void streamAudio(const QueueItem& item)
   }
 }
 
-void voiceSessionLoop(const dpp::snowflake guildId)
+void voiceSessionLoop(const dpp::snowflake guildId, uint64_t sessionGeneration)
 {
   logging::info("Voice session started for guild {}", static_cast<uint64_t>(guildId));
 
   voiceSessionStart.store(std::chrono::steady_clock::now(), std::memory_order_release);
   totalPlayTime.store(std::chrono::steady_clock::duration::zero(), std::memory_order_release);
 
+  try
+  {
   while (!shutdownRequested.load(std::memory_order_acquire)
          && voiceConnected.load(std::memory_order_acquire))
   {
@@ -288,7 +394,7 @@ void voiceSessionLoop(const dpp::snowflake guildId)
 
     if (item)
     {
-      streamAudio(*item);
+      streamAudio(*item, sessionGeneration);
       continue;
     }
 
@@ -310,19 +416,41 @@ void voiceSessionLoop(const dpp::snowflake guildId)
       break;
     }
   }
-
-  if (voiceConnected.load(std::memory_order_acquire))
+  }
+  catch (const std::exception& e)
   {
+    logging::error("Uncaught exception in voice session loop: {}", e.what());
+  }
+  catch (...)
+  {
+    logging::error("Unknown exception in voice session loop");
+  }
+
+  if (voiceSessionGeneration.load(std::memory_order_acquire) != sessionGeneration)
+  {
+    logging::info("Voice session {} superseded before teardown", sessionGeneration);
+    return;
+  }
+
+  if (voiceConnected.exchange(false, std::memory_order_acq_rel))
+  {
+    musicQueue.setDisconnected(true);
+
+    auto disconnectGuildId = dpp::snowflake(currentGuildId.load(std::memory_order_acquire));
+    logging::debug(
+      "Requesting voice disconnect, guild: {}",
+      static_cast<uint64_t>(std::as_const(disconnectGuildId)));
+
+    // Null out pointer first — DPP destroys the voice client during disconnect.
     {
       std::lock_guard lock(voiceClientMutex);
       activeVoiceClient = nullptr;
     }
-    if (auto* shard = currentShard.load(std::memory_order_acquire))
-    {
-      shard->disconnect_voice(guildId);
-    }
+
+    // Schedule disconnect on a separate thread so this thread can exit
+    // before on_voice_ready tries to join it (avoids deadlock).
+    scheduleDisconnect(disconnectGuildId, sessionGeneration);
   }
-  voiceConnected.store(false, std::memory_order_release);
   if (bot)
   {
     bot->set_presence(
@@ -460,7 +588,6 @@ void handlePlayCommand(
 
       if (auto* shard = event.from())
       {
-        currentShard.store(shard, std::memory_order_release);
         currentGuildId.store(static_cast<uint64_t>(msg.guild_id), std::memory_order_release);
         logging::debug("Initiating voice connection");
         shard->connect_voice(msg.guild_id, channelId, false, false, true);
@@ -505,7 +632,6 @@ void handlePlayCommand(
 
     if (auto* shard = event.from())
     {
-      currentShard.store(shard, std::memory_order_release);
       currentGuildId.store(static_cast<uint64_t>(msg.guild_id), std::memory_order_release);
       logging::debug("Initiating voice connection");
       shard->connect_voice(msg.guild_id, channelId, false, false, true);
@@ -901,6 +1027,17 @@ int main(int argc, char* argv[])
     return 1;
   }
   config::setGlobalConfig(std::move(*configResult));
+
+  // Guard against LogLevel enum drift between config and audio namespaces.
+  static_assert(
+    static_cast<int>(config::LogLevel::Debug) == static_cast<int>(audio::logging::Level::Debug)
+    && static_cast<int>(config::LogLevel::Info) == static_cast<int>(audio::logging::Level::Info)
+    && static_cast<int>(config::LogLevel::Warn) == static_cast<int>(audio::logging::Level::Warn)
+    && static_cast<int>(config::LogLevel::Error) == static_cast<int>(audio::logging::Level::Error),
+    "config::LogLevel and audio::logging::Level enumerators must match");
+  logging::setMinLevel(
+    static_cast<audio::logging::Level>(static_cast<int>(botConfig().logLevel)));
+
   logging::info("Config loaded from: {}", configPath);
 
   // Prefer the dedicated response channel fall back to the first command channel.
@@ -916,18 +1053,53 @@ int main(int argc, char* argv[])
 
   std::signal(SIGINT, signalHandler);
   std::signal(SIGTERM, signalHandler);
+  std::signal(SIGPIPE, SIG_IGN);   // Return EPIPE instead of killing process
+  // Auto-reap children; waitpid in producerLoop handles ECHILD gracefully.
+  std::signal(SIGCHLD, SIG_IGN);
 
   botStartTime = std::chrono::steady_clock::now();
 
   bot = std::make_unique<dpp::cluster>(
     botConfig().botToken, dpp::i_default_intents | dpp::i_message_content);
 
-  bot->on_log(dpp::utility::cout_logger());
+  bot->on_log([](const dpp::log_t& event) {
+    switch (event.severity)
+    {
+    case dpp::ll_trace:
+    case dpp::ll_debug:
+      logging::debug("[DPP] {}", event.message);
+      break;
+    case dpp::ll_info:
+      logging::info("[DPP] {}", event.message);
+      break;
+    case dpp::ll_warning:
+      logging::warn("[DPP] {}", event.message);
+      break;
+    case dpp::ll_error:
+    case dpp::ll_critical:
+      logging::error("[DPP] {}", event.message);
+      break;
+    }
+  });
 
   bot->on_ready([](const dpp::ready_t&) {
     logging::info("{}", botConfig().startupMessage);
     bot->set_presence(
       dpp::presence(dpp::ps_online, dpp::at_game, std::string(botConfig().statusPlayingGame)));
+
+    // After a full gateway reset (not the initial connection),
+    // any existing voice session is invalidated by Discord.
+    if (initialReadyReceived.exchange(true, std::memory_order_acq_rel))
+    {
+      if (voiceConnected.load(std::memory_order_acquire))
+      {
+        cleanupStaleVoice("gateway sent new READY (session was not resumable)");
+      }
+    }
+  });
+
+  bot->on_resumed([](const dpp::resumed_t&) {
+    logging::info("Gateway session resumed successfully");
   });
 
   bot->on_message_create([](const dpp::message_create_t& event) {
@@ -1018,21 +1190,38 @@ int main(int argc, char* argv[])
   bot->on_voice_ready([](const dpp::voice_ready_t& event) {
     if (auto* vc = event.voice_client)
     {
+      const auto newGeneration = voiceSessionGeneration.fetch_add(1, std::memory_order_acq_rel) + 1;
+
+      // Tear down previous session before locking — avoids deadlock
+      // if the old loop's disconnect_voice re-enters on_voice_ready.
+      voiceConnected.store(false, std::memory_order_release);
       {
         std::lock_guard lock(voiceClientMutex);
-        activeVoiceClient = vc;
+        activeVoiceClient = nullptr;
       }
-      voiceConnected.store(true, std::memory_order_release);
-      logging::info("Voice client set (ptr={})", static_cast<void*>(vc));
+      musicQueue.setDisconnected(true);
+      musicQueue.requestSkip();
 
-      musicQueue.resetForNewSession();
-      auto guildId = dpp::snowflake(currentGuildId.load(std::memory_order_acquire));
-
-      if (voiceSessionThread.joinable())
+      // Session mutex prevents concurrent on_voice_ready races.
       {
-        voiceSessionThread.join();
+        std::lock_guard sessionLock(voiceSessionMutex);
+        if (voiceSessionThread.joinable())
+        {
+          voiceSessionThread.join();
+        }
+
+        // Now set up the new session
+        {
+          std::lock_guard lock(voiceClientMutex);
+          activeVoiceClient = vc;
+        }
+        voiceConnected.store(true, std::memory_order_release);
+        logging::info("Voice client set (ptr={})", static_cast<void*>(vc));
+
+        musicQueue.resetForNewSession();
+        auto guildId = dpp::snowflake(currentGuildId.load(std::memory_order_acquire));
+        voiceSessionThread = std::jthread(voiceSessionLoop, guildId, newGeneration);
       }
-      voiceSessionThread = std::jthread(voiceSessionLoop, guildId);
     }
   });
 
@@ -1042,13 +1231,7 @@ int main(int argc, char* argv[])
       if (!event.state.channel_id)
       {
         logging::info("Bot disconnected from voice channel");
-        voiceConnected.store(false, std::memory_order_release);
-        {
-          std::lock_guard lock(voiceClientMutex);
-          activeVoiceClient = nullptr;
-        }
-        musicQueue.setDisconnected(true);
-        musicQueue.requestSkip();
+        cleanupStaleVoice("bot left voice channel");
       }
       else
       {
@@ -1060,38 +1243,124 @@ int main(int argc, char* argv[])
 
   bot->start(dpp::st_return);
 
+  bool gatewayRecoveryActive = false;
+  bool restartForGatewayStall = false;
+  std::chrono::steady_clock::time_point gatewayRecoveryStart{};
+
+  while (!shutdownRequested.load(std::memory_order_acquire))
   {
-    std::unique_lock lock(shutdownMutex);
-    shutdownCV.wait(lock, [] { return shutdownRequested.load(std::memory_order_acquire); });
+    std::this_thread::sleep_for(std::chrono::seconds(1));
+
+    auto* shard = bot ? bot->get_shard(0) : nullptr;
+    const bool shardConnected = shard != nullptr && shard->is_connected();
+
+    if (!initialReadyReceived.load(std::memory_order_acquire))
+    {
+      gatewayRecoveryActive = false;
+      continue;
+    }
+
+    if (shardConnected)
+    {
+      if (gatewayRecoveryActive)
+      {
+        const auto elapsed = std::chrono::steady_clock::now() - gatewayRecoveryStart;
+        logging::info(
+          "Gateway shard recovered after {}s",
+          std::chrono::duration_cast<std::chrono::seconds>(elapsed).count());
+        gatewayRecoveryActive = false;
+      }
+      continue;
+    }
+
+    if (!gatewayRecoveryActive)
+    {
+      gatewayRecoveryActive = true;
+      gatewayRecoveryStart = std::chrono::steady_clock::now();
+      logging::warn(
+        "Gateway shard disconnected; waiting up to {}s for recovery",
+        std::chrono::duration_cast<std::chrono::seconds>(botConfig().gatewayReconnectTimeout)
+          .count());
+      continue;
+    }
+
+    const auto elapsed = std::chrono::steady_clock::now() - gatewayRecoveryStart;
+    if (elapsed >= botConfig().gatewayReconnectTimeout)
+    {
+      restartForGatewayStall = true;
+      logging::error(
+        "Gateway reconnect stalled for {}s; exiting so the supervisor can restart the bot",
+        std::chrono::duration_cast<std::chrono::seconds>(elapsed).count());
+      break;
+    }
+  }
+
+  if (restartForGatewayStall)
+  {
+    logging::error("Skipping graceful shutdown after gateway stall; forcing process restart");
+    std::cerr << std::flush;
+    std::_Exit(1);
   }
 
   logging::info("Shutting down...");
 
+  // Send goodbye message before tearing anything down
+  auto respCh = responseChannel();
+  if (!restartForGatewayStall && respCh != dpp::snowflake(0))
+  {
+    bot->message_create(dpp::message()
+      .set_channel_id(respCh)
+      .set_content(std::format("Time's up, gotta go. Adios! {}", botConfig().botReactionImage)));
+    // Give the HTTP request time to dispatch before we tear down
+    std::this_thread::sleep_for(std::chrono::seconds(1));
+  }
+
   musicQueue.shutdown();
   musicQueue.requestSkip();
 
-  if (voiceSessionThread.joinable())
   {
-    voiceSessionThread.join();
+    std::lock_guard sessionLock(voiceSessionMutex);
+    if (voiceSessionThread.joinable())
+    {
+      voiceSessionThread.join();
+    }
   }
 
-  dpp::discord_client* shutdownShard = currentShard.load(std::memory_order_acquire);
+  dpp::discord_client* shutdownShard = bot ? bot->get_shard(0) : nullptr;
 
   if (voiceConnected.exchange(false, std::memory_order_acq_rel))
   {
+    {
+      std::lock_guard lock(voiceClientMutex);
+      activeVoiceClient = nullptr;
+    }
     auto guildId = dpp::snowflake(currentGuildId.load(std::memory_order_acquire));
     if (shutdownShard)
     {
       shutdownShard->disconnect_voice(guildId);
     }
   }
-  
+
   if (shutdownShard)
   {
     shutdownShard->send_close_packet();
   }
 
+  // Join all tracked disconnect threads to guarantee they finish before
+  // bot is destroyed — eliminates use-after-free on the cluster pointer.
+  {
+    std::lock_guard lock(disconnectThreadsMutex);
+    for (auto& t : disconnectThreads)
+    {
+      if (t.thread.joinable())
+      {
+        t.thread.join();
+      }
+    }
+    disconnectThreads.clear();
+  }
+
   bot->shutdown();
 
-  return 0;
+  return restartForGatewayStall ? 1 : 0;
 }

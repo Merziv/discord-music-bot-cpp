@@ -1,14 +1,12 @@
-# Build directories
 build/
 dist/
 CMakeFiles/
 Testing/
 .cmake/
 
-# Config files (contains secrets)
+.gitconfig
 config.json
 
-# CMake generated files
 CMakeCache.txt
 cmake_install.cmake
 CTestTestfile.cmake
@@ -18,7 +16,6 @@ compile_commands.json
 CMakePresets.json
 CMakeUserPresets.json
 
-# Conan generated files
 conan_toolchain.cmake
 cmakedeps_macros.cmake
 conandeps_legacy.cmake
@@ -37,18 +34,17 @@ deactivate_conanrun.sh
 *ConfigVersion.cmake
 Find*.cmake
 
-# Clangd
 .cache/
 .clangd
+.clang*
 
-# Build artifacts
 *.o
 *.a
 *.so
 *.dylib
 music_bot
+*.ps1
 
-# IDE
 .vscode/
 .idea/
 *.swp
@@ -56,12 +52,10 @@ music_bot
 *~
 .github/
 
-# Temporary files
 *.log
 *.tmp
 *.pcm
 *.raw
 
-# OS files
 .DS_Store
 Thumbs.db

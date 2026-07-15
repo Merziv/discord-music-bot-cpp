@@ -1,6 +1,6 @@
 # Discord Music Bot
 
-A high-performance Discord music bot written in modern C++. Streams audio from YouTube and other sources directly to Discord voice channels using yt-dlp for extraction and FFmpeg for transcoding.
+A high-performance Discord music bot written in modern C++. Streams audio from YouTube and other sources directly to Discord voice channels using a native C++ extractor and in-process FFmpeg decoding.
 
 ## Features
 
@@ -40,8 +40,8 @@ A high-performance Discord music bot written in modern C++. Streams audio from Y
 
 ### Runtime
 
-- FFmpeg (system package)
-- yt-dlp (pip/pipx)
+- No yt-dlp dependency
+- No external ffmpeg process in the playback path
 
 ## Configuration
 
@@ -58,6 +58,7 @@ cp config.example.json config.json
 | `channel_id` | Channel ID where bot responds |
 | `reaction_image` | Emoji for "Now playing" messages |
 | `idle_timeout_minutes` | Disconnect after inactivity |
+| `gateway_reconnect_timeout_seconds` | How long to wait for shard recovery before exiting for supervisor restart |
 
 ## Running
 
@@ -65,12 +66,29 @@ cp config.example.json config.json
 ./music_bot [config.json]
 ```
 
+## Process Supervision
+
+This bot now exits with a non-zero status if the Discord gateway stays disconnected past
+`gateway_reconnect_timeout_seconds`. That is intentional: it is the outer recovery path for
+idle reconnect stalls where DPP never reaches `READY` or `RESUMED` again.
+
+Run it under a supervisor with automatic restart enabled. For `systemd`, use a service with
+at least:
+
+```ini
+[Service]
+WorkingDirectory=/path/to/discord-music-bot-cpp
+ExecStart=/path/to/discord-music-bot-cpp/build/music_bot /path/to/discord-music-bot-cpp/config.json
+Restart=always
+RestartSec=5
+```
+
 ## Architecture
 
+- **Native extractor** - Uses YouTube Innertube and web-fallback parsing directly in C++
+- **In-process decoder** - Uses libavformat/libavcodec/libswresample without subprocesses
 - **Lock-free ring buffer** - Audio frame buffering between producer/consumer threads
-- **Producer thread** - Runs FFmpeg, reads PCM data, fills ring buffer
 - **Consumer thread** - Encodes to Opus, sends to Discord with precise timing
-- **yt-dlp integration** - Extracts stream URLs with multiple client fallbacks
 
 ## License
 

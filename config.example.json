@@ -13,6 +13,8 @@
       "bot-spam": 123456789012345678
     },
     "reaction_image": "🎵",
-    "idle_timeout_minutes": 5
+    "idle_timeout_minutes": 5,
+    "gateway_reconnect_timeout_seconds": 180,
+    "log_level": "info"
   }
 }

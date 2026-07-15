@@ -240,6 +240,36 @@ std::expected<ConfigManager, std::string> ConfigManager::loadFromFile(std::strin
     {
       cfg.bot.idleTimeout = std::chrono::minutes(5);
     }
+
+    if (auto val = getInt(*botSection, "gateway_reconnect_timeout_seconds"))
+    {
+      const int seconds = (*val > 0) ? *val : 1;
+      cfg.bot.gatewayReconnectTimeout = std::chrono::seconds(seconds);
+    }
+    else
+    {
+      cfg.bot.gatewayReconnectTimeout = std::chrono::minutes(3);
+    }
+
+    if (auto val = getString(*botSection, "log_level"))
+    {
+      if (*val == "debug")
+      {
+        cfg.bot.logLevel = LogLevel::Debug;
+      }
+      else if (*val == "info")
+      {
+        cfg.bot.logLevel = LogLevel::Info;
+      }
+      else if (*val == "warn")
+      {
+        cfg.bot.logLevel = LogLevel::Warn;
+      }
+      else if (*val == "error")
+      {
+        cfg.bot.logLevel = LogLevel::Error;
+      }
+    }
   }
   else
   {

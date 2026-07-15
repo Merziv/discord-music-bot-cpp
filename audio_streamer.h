@@ -4,6 +4,7 @@
 #include <atomic>
 #include <chrono>
 #include <cstdint>
+#include <expected>
 #include <format>
 #include <functional>
 #include <iostream>
@@ -35,6 +36,13 @@ enum class Level : std::uint8_t
   Error
 };
 
+inline std::atomic<Level> g_minLevel{Level::Info};
+
+inline void setMinLevel(Level level)
+{
+  g_minLevel.store(level, std::memory_order_relaxed);
+}
+
 [[nodiscard]] inline std::string timestamp()
 {
   using namespace std::chrono;
@@ -57,6 +65,10 @@ enum class Level : std::uint8_t
 template<typename... Args>
 void log(Level level, std::format_string<Args...> fmt, Args&&... args)
 {
+  if (level < g_minLevel.load(std::memory_order_relaxed))
+  {
+    return;
+  }
   static constexpr std::array levelNames = {"DEBUG", "INFO", "WARN", "ERROR"};
   const auto msg = std::format(fmt, std::forward<Args>(args)...);
   std::cerr << std::format("[{}] [{}] {}\n", timestamp(), levelNames[static_cast<int>(level)], msg);
@@ -182,16 +194,18 @@ class AudioStreamer
 {
   using AudioFrame = std::array<int16_t, TOTAL_SAMPLES>;
   using RingBuffer = LockFreeRingBuffer<AudioFrame, RING_BUFFER_FRAMES>;
+  using StreamRefreshCallback = std::function<std::expected<std::string, std::string>()>;
 
   std::string _streamUrl;
   std::string _title;
+  bool _isLive;
+  StreamRefreshCallback _refreshStreamUrl;
   PlaybackController _controller;
 
   RingBuffer _ringBuffer;
   std::atomic<bool> _producerDone{false};
   std::atomic<bool> _shouldStop{false};
   std::atomic<bool> _playedAudio{false};
-  std::atomic<int> _ffmpegPid{-1};
 
   std::unique_ptr<OpusEncoder, decltype(&opus_encoder_destroy)> _encoder{
     nullptr, opus_encoder_destroy};
@@ -202,6 +216,8 @@ public:
   AudioStreamer(
     std::string streamUrl,
     std::string title,
+    bool isLive,
+    StreamRefreshCallback refreshStreamUrl,
     PlaybackController controller);
 
   ~AudioStreamer();
@@ -220,8 +236,6 @@ private:
   void initEncoder();
   void producerLoop(const std::stop_token& stopToken);
   void consumerLoop();
-
-  [[nodiscard]] static std::string makeTempLogPath(const char* prefix);
 };
 
 }  // namespace audio
